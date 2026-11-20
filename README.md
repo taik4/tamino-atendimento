@@ -20,7 +20,10 @@ Funciona no **Linux** (testado no CachyOS/KDE) e no **Windows 10/11**.
 |---|---|
 | **Fila** | Mensagem nova de cliente vira um card com o contexto da conversa e dois rascunhos da IA: 📋 *Informativo* e ⏳ *Genérico (segurar)*. Você edita e dispara. O **✕** fecha o card sem abrir. |
 | **🔕 Ignorar conversa** | O 🔕 no canto de uma conversa da lista faz grupos fora do suporte pararem de gerar card e aviso. Para reativar, use o 🔔 (filtro *Todas*) ou 🔧 → *Conversas ignoradas*. |
-| **Conversa** | Histórico completo, envio de mensagem e anexos, ↩︎ responder citando, ✏️ editar, 🗑 apagar, ✅ concluir/reabrir, 🌐 traduzir e respostas rápidas em PT/EN/中文/ES. |
+| **Conversa** | Histórico completo, envio de mensagem e anexos (o áudio do WhatsApp é convertido para MP3 e toca até no iPhone), ↩︎ responder citando, ✏️ editar, 🗑 apagar, ✅ concluir/reabrir, 🌐 traduzir e respostas rápidas em PT/EN/中文/ES. |
+| **⏱️ Ponto** | No canto superior direito: ▶ Entrar / ⏹ Sair, com cronômetro do turno. O painel pergunta se envia a mensagem padrão no grupo do N2 (textos editáveis em 🔧). O tempo vai para os Insights. |
+| **✨ Corretor** | O navegador sublinha erros em pt-BR enquanto você digita. O botão ✨ Corrigir pede à IA para revisar o texto mantendo o seu tom, e dá para desfazer. |
+| **Histórico** | ⬆️ Carregar mensagens anteriores, 20 por vez, e "Ver todas as conversas" com paginação. |
 | **Perguntar ao N2** | Envia a dúvida para o grupo interno a partir de qualquer conversa. |
 | **📈 Insights** | Atendimentos, mensagens, tempo ativo e 1ª resposta por turno, com gráficos e exportação em **PDF/JPEG**. |
 | **Dashboard / Saques / Pagamentos / Webhooks / Usuários / Taxas** | Consultas **só de leitura** ao backoffice. Nada é alterado lá. |
