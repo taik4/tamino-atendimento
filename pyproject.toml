@@ -1,0 +1,15 @@
+[project]
+name = "tamino-atendimento"
+version = "0.1.0"
+description = "Painel de atendimento Tamino: fila de respostas, MCP, consultas ao backoffice e insights"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=2,<3",
+    "anthropic",
+    "playwright==1.64.0",
+    "segno",
+    "tzdata; sys_platform == 'win32'",
+]
+
+[tool.uv]
+package = false

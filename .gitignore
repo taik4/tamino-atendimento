@@ -1,0 +1,7 @@
+# segredos e dados locais
+.env
+*.db
+.venv/
+__pycache__/
+*.pyc
+*.tmp
