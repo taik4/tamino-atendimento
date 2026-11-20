@@ -1149,6 +1149,39 @@ def fi_html(f, filtro, ign=None):
             f'<div class=t>{html.escape((f["quem"] + ": ") if f["quem"] else "")}{html.escape(f["texto"][:90])}</div></a>')
 
 
+def audio_mp3(url):
+    """Baixa o áudio do Evo (OGG/Opus do WhatsApp) e converte p/ MP3, que toca em qualquer navegador (inclusive Safari).
+    Cache em disco. Sem ffmpeg, devolve o original. Só aceita URL do próprio Evo (evita o painel virar proxy aberto)."""
+    import hashlib
+    import shutil
+    import subprocess
+    host_evo = urllib.parse.urlparse(EVO_API()).netloc
+    alvo = urllib.parse.urlparse(url)
+    if alvo.scheme != "https" or alvo.netloc != host_evo:
+        raise ValueError("URL de áudio fora do Evo")
+    pasta = pasta_dados() / "audio"
+    pasta.mkdir(parents=True, exist_ok=True)
+    h = hashlib.sha1(url.encode()).hexdigest()
+    mp3, orig = pasta / f"{h}.mp3", pasta / f"{h}.ogg"
+    if mp3.exists():
+        return mp3, "audio/mpeg"
+    if not orig.exists():
+        req = urllib.request.Request(url, headers={"user-agent": "curl/8.10.0"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            dados = r.read(25 * 1024 * 1024 + 1)
+        if len(dados) > 25 * 1024 * 1024:
+            raise ValueError("áudio grande demais")
+        orig.write_bytes(dados)
+    ff = shutil.which("ffmpeg")
+    if ff:
+        r = subprocess.run([ff, "-loglevel", "error", "-y", "-i", str(orig), "-vn", "-ac", "1", "-b:a", "64k", str(mp3)],
+                           capture_output=True, timeout=120)
+        if r.returncode == 0 and mp3.exists():
+            orig.unlink(missing_ok=True)
+            return mp3, "audio/mpeg"
+    return orig, "audio/ogg"
+
+
 def anexos_html(anexos):
     out = []
     for a in anexos or []:
@@ -1158,7 +1191,8 @@ def anexos_html(anexos):
         if t == "image":
             out.append(f'<a href="{u}" target=_blank><img class=ax src="{html.escape(a.get("thumb") or a.get("url"))}" alt="{nome}" loading=lazy></a>')
         elif t == "audio":
-            out.append(f'<audio controls preload=none src="{u}"></audio>')
+            prox = "/audio?u=" + urllib.parse.quote(a.get("url") or "", safe="")
+            out.append(f'<audio controls preload=none src="{prox}"></audio><a class=arq href="{u}" target=_blank title="Baixar o original">⬇️</a>')
         elif t == "video":
             out.append(f'<video controls preload=none src="{u}" class=ax></video>')
         else:
@@ -1820,6 +1854,31 @@ No iPhone pelo controle remoto, o Safari não permite notificação fora da pág
         if url.path.startswith("/c/"):
             return self.conversa(url.path[3:], filtro)
         qs = {k: v[0] for k, v in urllib.parse.parse_qs(url.query).items()}
+        if url.path == "/audio":
+            try:
+                arq, tipo = audio_mp3(urllib.parse.parse_qs(url.query).get("u", [""])[0])
+            except Exception as e:
+                return self._html(f"áudio indisponível: {html.escape(str(e))}", 502)
+            dados = arq.read_bytes()
+            ini, fim, cod = 0, len(dados) - 1, 200
+            m = re.match(r"bytes=(\d*)-(\d*)", self.headers.get("range", ""))
+            if m and (m.group(1) or m.group(2)):
+                if m.group(1):
+                    ini = int(m.group(1))
+                    fim = min(int(m.group(2)), fim) if m.group(2) else fim
+                else:
+                    ini = max(0, len(dados) - int(m.group(2)))
+                cod = 206
+            self.send_response(cod)
+            self.send_header("content-type", tipo)
+            self.send_header("accept-ranges", "bytes")
+            self.send_header("cache-control", "private, max-age=86400")
+            self.send_header("content-length", str(fim - ini + 1))
+            if cod == 206:
+                self.send_header("content-range", f"bytes {ini}-{fim}/{len(dados)}")
+            self.end_headers()
+            self.wfile.write(dados[ini:fim + 1])
+            return
         if url.path == "/insights":
             return self.insights({k: v[0] for k, v in urllib.parse.parse_qs(url.query).items()}, filtro)
         if url.path == "/insights/exportar":
