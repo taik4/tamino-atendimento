@@ -888,7 +888,9 @@ button{background:var(--ac);color:#fff;border:0;border-radius:8px;padding:9px 18
 .idi{margin:8px 0 0} .idi select{background:#0c0e12;color:var(--tx);border:1px solid #2a2f39;border-radius:8px;padding:5px 8px;font:inherit}
 .tr{background:transparent;color:#7fb0ff;border:1px solid #3a4253;border-radius:6px;padding:1px 8px;font-size:12px;font-weight:500;margin-left:6px}
 .trad{margin:4px 0 2px 12px;padding:6px 10px;border-left:3px solid #7fb0ff;background:#151a24;color:#dfe6f2;font-size:14px;white-space:pre-wrap}
-.cd>summary{list-style:none;cursor:pointer} .cd>summary::-webkit-details-marker{display:none}
+.cd>summary{list-style:none;cursor:pointer;position:relative;padding-right:40px}
+.xcard{position:absolute;top:-6px;right:-6px;width:34px;height:34px;padding:0;border-radius:8px;background:#232834;border:1px solid #3a4253;color:#e8ecf3;font-size:15px}
+.xcard:hover{background:#5a2323;border-color:#a33} .cd>summary::-webkit-details-marker{display:none}
 .cd .ultima{display:none} .abrir{float:right;color:#7fb0ff;font-weight:500}
 .topo{display:flex;align-items:center;gap:10px;position:sticky;top:0;z-index:5;background:var(--bg);padding:6px 0}
 .topo h2{flex:1;margin:0;font-size:20px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -1806,6 +1808,7 @@ No iPhone pelo controle remoto, o Safari não permite notificação fora da pág
 <form method=post class=card>
   <input type=hidden name=t value="{TOKEN}"><input type=hidden name=id value={rid}><input type=hidden name=f value="{html.escape(filtro)}">
   <details class=cd open><summary><div class=meta><b>{html.escape(nome)}</b> · {datetime.fromtimestamp(cr, TZ):%d/%m %H:%M}
+  <button name=acao value=descartar class=xcard title="Fechar (descartar este card)" onclick="event.stopPropagation()">✕</button>
   <a class=abrir href="/c/{html.escape(cid)}?f={html.escape(filtro)}">abrir conversa ›</a></div>
   <div class=ultima>{html.escape(ultima_msg(det))}</div></summary>
   {f'<div class=alerta>⚠ {html.escape(al)}</div>' if al else ''}
