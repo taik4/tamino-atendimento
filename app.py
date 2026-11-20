@@ -1244,6 +1244,11 @@ RAPIDAS = [
                     "en": "Could you give me more details about what happened?",
                     "zh": "能告诉我更多具体情况吗？",
                     "es": "¿Me puedes dar más detalles de lo que pasó?"}),
+    ("📚 Documentação", {
+        "pt": "Segue a documentação da API: https://docs.tamino.com.br\nPara começar, o Quick Start: https://docs.tamino.com.br/docs/quick-start\nE a referência completa dos endpoints: https://api.tamino.com.br/v1/docs",
+        "en": "Here's our API documentation: https://docs.tamino.com.br\nTo get started, the Quick Start: https://docs.tamino.com.br/docs/quick-start\nAnd the full endpoint reference: https://api.tamino.com.br/v1/docs",
+        "zh": "这是我们的API文档：https://docs.tamino.com.br\n快速入门：https://docs.tamino.com.br/docs/quick-start\n完整接口参考：https://api.tamino.com.br/v1/docs",
+        "es": "Aquí está la documentación de la API: https://docs.tamino.com.br\nPara empezar, el Quick Start: https://docs.tamino.com.br/docs/quick-start\nY la referencia completa de endpoints: https://api.tamino.com.br/v1/docs"}),
     ("⏳ Segurar", {"pt": "Só um instante, estamos verificando.",
                    "en": "One moment, we're checking.",
                    "zh": "请稍等，我们正在核实。",
