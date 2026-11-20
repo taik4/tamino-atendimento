@@ -264,9 +264,10 @@ def evo_headers():
             "origin": EVO_WEB(), "referer": EVO_WEB() + "/"}
 
 
-def evo_historico(conv):
-    """Últimas mensagens (mais antiga primeiro) como dicts {tipo, nome, texto, hora}."""
-    d = com_renovacao(lambda: http_json("GET", evo_url(conv), evo_headers()))
+def evo_historico(conv, antes_de=None):
+    """Mensagens (mais antiga primeiro), 20 por vez; antes_de = id da mensagem para buscar as anteriores."""
+    url = evo_url(conv) + (f"?before={urllib.parse.quote(antes_de)}" if antes_de else "")
+    d = com_renovacao(lambda: http_json("GET", url, evo_headers()))
     saida = []
     for m in (d or {}).get("data", []):
         ts = m.get("created_at")
@@ -917,6 +918,7 @@ table.rap textarea{min-width:160px;font-family:inherit;font-size:13px}
 .anexar{display:inline-block;margin:6px 0;color:#7fb0ff;cursor:pointer} .anexar input{display:none}
 .busca input{width:100%;box-sizing:border-box;background:#0c0e12;color:var(--tx);border:1px solid #2a2f39;border-radius:8px;padding:8px 10px;margin:8px 0;font:inherit}
 .feed.lista{position:static;max-height:none}
+.mais{display:block;margin:4px auto 10px;font-size:13px} .vermais{display:block;text-align:center;padding:10px 0 2px;color:#7fb0ff;font-size:13px}
 .chart{width:100%;height:auto;display:block} .chart .mk{fill:#5fd3a4} .chart .bar:hover .mk{fill:#8ff0c7}
 .chart .gd{stroke:#2a2f39;stroke-width:1} .chart .bl{stroke:#3a4253;stroke-width:1} .chart .ax{fill:#8b919c;font-size:11px}
 .chart .hc{fill:#5fd3a4;stroke:#111318;stroke-width:2}
@@ -1117,7 +1119,8 @@ def feed_html(filtro="novas"):
     itens = [f for f in FEED if filtro != "novas" or (f["tipo"] == "incoming" and f["id"] not in ign)]
     if not itens:
         return "<p class=vazio>Nenhuma conversa aguardando resposta.</p>"
-    return "".join(fi_html(f, filtro, ign) for f in itens[:40])
+    return ("".join(fi_html(f, filtro, ign) for f in itens[:40])
+            + f'<a class=vermais href="/buscar?status=all&f={filtro}">Ver todas as conversas, inclusive antigas ›</a>')
 
 
 def ignorados():
@@ -1677,7 +1680,8 @@ ligue só em rede confiável. Desligar desconecta todos os celulares.</p>"""
         extra = "" if listas["labels"] else "<p class=meta>Sem etiquetas e times cadastrados no Evo ainda; quando existirem, os filtros aparecem aqui.</p>"
         self._html(pagina("Buscar conversas", f"""<h2>🔎 Buscar conversas</h2>
 {filtros_html(campos, val, f'<input type=hidden name=f value="{html.escape(filtro)}">')}{extra}
-<p class=meta>{total} encontrada(s)</p><div class="feed lista">{res}</div>""", filtro, recarregar=False))
+<p class=meta>{total} encontrada(s)</p><div class="feed lista">{res}</div>
+{paginacao("/buscar", {**val, "f": filtro}, max(1, int(qs.get("page", "1") or 1)), total, 25)}""", filtro, recarregar=False))
 
     def insights(self, qs, filtro):
         ABA_ATUAL["Insights"] = "/insights"
@@ -1851,6 +1855,21 @@ No iPhone pelo controle remoto, o Safari não permite notificação fora da pág
         if url.path.startswith("/static/"):
             return self.estatico(url.path)
         filtro = urllib.parse.parse_qs(url.query).get("f", ["novas"])[0]
+        if url.path.startswith("/c/") and url.path.endswith("/anteriores"):
+            cid = url.path[3:-len("/anteriores")]
+            antes = urllib.parse.parse_qs(url.query).get("antes", [""])[0]
+            if not RE_CONV.match(cid) or not RE_CONV.match(antes):
+                return self._html("inválido", 400)
+            try:
+                hist = evo_historico(cid, antes)
+            except Exception as e:
+                return self._html(f"falhou: {html.escape(str(e))}", 502)
+            self.send_response(200)
+            self.send_header("content-type", "text/html; charset=utf-8")
+            self.send_header("x-mais-antiga", hist[0]["id"] if hist else "")
+            self.end_headers()
+            self.wfile.write(msgs_html(hist, acoes=True).encode())
+            return
         if url.path.startswith("/c/"):
             return self.conversa(url.path[3:], filtro)
         qs = {k: v[0] for k, v in urllib.parse.parse_qs(url.query).items()}
@@ -2071,10 +2090,15 @@ Piso entrada: {html.escape(fmt_taxa(piso.get("in")))} · Piso saída: {html.esca
         self._html(pagina(nome, f"""<div class=topo><a class=voltar href="/?f={f}">←</a><h2>{html.escape(nome)}</h2>
 {bst}<a class=fechar href="/?f={f}" title="Fechar conversa">✕</a></div>
 {'<p class=meta>✅ Conversa concluída. Ao enviar mensagem, o Evo reabre.</p>' if concluida else ''}
-<div class=conv id=c>{msgs_html(hist, acoes=True) or '<p class=vazio>Sem mensagens.</p>'}</div>
+<div class=conv id=c>{(f'<button type=button class="sec mais" data-antes="{html.escape(hist[0]["id"])}" onclick="anteriores(this)">⬆️ Carregar mensagens anteriores</button>' if len(hist) >= 20 else '')}{msgs_html(hist, acoes=True) or '<p class=vazio>Sem mensagens.</p>'}</div>
 <script>c.scrollTop=c.scrollHeight;
 function responder(id,p){{document.getElementById('rpl').value=id;let v=document.getElementById('rplv');v.style.display='block';
 v.querySelector('span').textContent=p;document.getElementById('txc').focus();sujo=true}}
+function anteriores(b){{b.disabled=true;b.textContent='carregando…';sujo=true;
+fetch('/c/{cid}/anteriores?antes='+b.dataset.antes).then(r=>r.text().then(h=>[h,r.headers.get('x-mais-antiga')])).then(([h,ant])=>{{
+  let c=document.getElementById('c'),alt=c.scrollHeight;b.insertAdjacentHTML('afterend',h);
+  if(ant&&h.trim()){{b.dataset.antes=ant;b.disabled=false;b.textContent='⬆️ Carregar mensagens anteriores';c.prepend(b)}}else b.remove();
+  c.scrollTop+=c.scrollHeight-alt}}).catch(()=>{{b.disabled=false;b.textContent='Falhou, tentar de novo'}})}}
 function semResposta(){{document.getElementById('rpl').value='';document.getElementById('rplv').style.display='none'}}
 function acaoMsg(corpo){{return fetch('/',{{method:'POST',headers:{{'content-type':'application/x-www-form-urlencoded'}},body:'t={TOKEN}&conv={cid}&'+corpo}})
 .then(r=>{{if(!r.ok)return r.text().then(t=>alert('Falhou: '+t.replace(/<[^>]+>/g,'').slice(0,200)));location.reload()}})}}
