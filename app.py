@@ -996,6 +996,7 @@ table.rap textarea{min-width:160px;font-family:inherit;font-size:13px}
 a.btn{display:inline-block;background:var(--ac);color:#fff;border-radius:8px;padding:9px 16px;font-weight:600;margin:4px 6px 4px 0}
 .filtros input[type=date]{flex:0 1 auto;min-width:0}
 input[type=time]{background:#0c0e12;color:var(--tx);border:1px solid #2a2f39;border-radius:8px;padding:6px 8px;font:inherit}
+#convbox{margin:4px 0 8px} #convbox table{font-size:13px}
 .corr{display:flex;gap:6px;margin:-2px 0 6px} .corr button{padding:5px 12px;font-size:13px;border:1px solid #3a4253;border-radius:8px}
 .lbls{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:8px;margin:10px 0 0}
 .lbl{background:#232834;color:#e8ecf3;border:1px solid #3a4253;border-radius:8px;padding:9px 12px;font-weight:600;font-size:14px;text-align:left}
@@ -1372,6 +1373,66 @@ def botao_texto(alvo, texto, rot, on=False):
     return (f'<button type=button class="lbl {"on" if on else ""}" data-t="{html.escape(texto or "", quote=True)}" '
             f'onclick="let t=document.getElementById(\'{alvo}\');t.value=this.dataset.t;t.focus();'
             f'this.parentNode.querySelectorAll(\'.lbl\').forEach(x=>x.classList.remove(\'on\'));this.classList.add(\'on\')">{rot}</button>')
+
+
+def _alnum(t):
+    import unicodedata
+    t = unicodedata.normalize("NFKD", t or "").encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z0-9]", "", t)
+
+
+def conversao(nome_conversa=""):
+    """Conversão por tempo (dashboard de suporte, hoje). Usa a conta do cliente se o nome da conversa casar com um
+    tenant com volume; senão a média da plataforma. Retorna dict com faixas cumulativas."""
+    d = tamino_get("/admin/management-dashboard/support", timeout=60) or {}
+    cs = d.get("chargeStats") or {}
+    limites = cs.get("timeBucketsMinutes") or [1, 5, 10, 30, 60]
+    alvo, escopo = (cs.get("total") or {}).get("today") or {}, "plataforma"
+    nc = _alnum(nome_conversa)
+    melhor = None
+    for x in cs.get("tenants") or []:
+        tn = _alnum(x.get("tenantName"))
+        h = x.get("today") or {}
+        ger = (h.get("generated") or {}).get("count", 0) if isinstance(h.get("generated"), dict) else h.get("generated") or 0
+        if len(tn) >= 4 and tn in nc and ger and (not melhor or len(tn) > len(melhor[0])):
+            melhor = (tn, h)
+    if melhor:
+        alvo, escopo = melhor[1], "conta"
+    cnt = lambda v: (v or {}).get("count", 0) if isinstance(v, dict) else (v or 0)
+    ger, pagas = cnt(alvo.get("generated")), cnt(alvo.get("paid"))
+    b = alvo.get("timeBuckets") or []
+    faixas, acum = [], 0
+    for i, lim in enumerate(limites):
+        acum += b[i] if i < len(b) else 0
+        faixas.append((lim, 100 * acum / ger if ger else 0, 100 * acum / pagas if pagas else 0))
+    return {"escopo": escopo, "geradas": ger, "pagas": pagas, "taxa": alvo.get("successRate"),
+            "medio": alvo.get("avgSecondsToPay"), "faixas": faixas}
+
+
+TXT_CONV = {
+    "pt": "Hoje a conversão {escopo} tá assim: {f1}% pagam em até 1 min, {f5}% em até 5 min e {f10}% em até 10 min. Depois disso praticamente não muda, fechando em {taxa}%. Tempo médio de pagamento: {medio}s.",
+    "en": "Today's conversion {escopo}: {f1}% paid within 1 min, {f5}% within 5 min and {f10}% within 10 min. After that it barely changes, closing at {taxa}%. Average time to pay: {medio}s.",
+    "zh": "今天{escopo}的转化率：1分钟内支付{f1}%，5分钟内{f5}%，10分钟内{f10}%。之后基本不变，总体为{taxa}%。平均支付时间：{medio}秒。",
+    "es": "Hoy la conversión {escopo} está así: {f1}% pagan en hasta 1 min, {f5}% en hasta 5 min y {f10}% en hasta 10 min. Después casi no cambia, cerrando en {taxa}%. Tiempo medio de pago: {medio}s.",
+}
+ESCOPO_TXT = {"pt": ("da sua conta", "geral da plataforma"), "en": ("on your account", "across the platform"),
+              "zh": ("您账户", "平台整体"), "es": ("de tu cuenta", "general de la plataforma")}
+
+
+def conversao_texto(c, lang):
+    f = {lim: v for lim, v, _ in c["faixas"]}
+    n = lambda v: f"{v:.0f}" if lang != "pt" else f"{v:.0f}"
+    esc = ESCOPO_TXT.get(lang, ESCOPO_TXT["pt"])[0 if c["escopo"] == "conta" else 1]
+    return TXT_CONV.get(lang, TXT_CONV["pt"]).format(escopo=esc, f1=n(f.get(1, 0)), f5=n(f.get(5, 0)), f10=n(f.get(10, 0)),
+                                                     taxa=f"{c['taxa']:.0f}" if c.get("taxa") is not None else "—", medio=c.get("medio") or "—")
+
+
+def conversao_tabela(c):
+    linhas = [[f"até {lim} min", f"{v:.1f}%", f"{vp:.1f}%"] for lim, v, vp in c["faixas"]]
+    titulo = "da conta do cliente" if c["escopo"] == "conta" else "geral da plataforma (cliente sem volume hoje)"
+    return (f'<div class=meta>Conversão hoje, {titulo}: {c["geradas"]:,} geradas · {c["pagas"]:,} pagas · '
+            f'total {c["taxa"] if c["taxa"] is not None else "—"}% · médio {c["medio"] or "—"}s</div>'.replace(",", ".")
+            + tabela(["Pago em", "% das geradas", "% das pagas"], linhas))
 
 
 def botao_corrigir(alvo):
@@ -2016,6 +2077,22 @@ No iPhone pelo controle remoto, o Safari não permite notificação fora da pág
             return self.insights({k: v[0] for k, v in urllib.parse.parse_qs(url.query).items()}, filtro)
         if url.path == "/insights/exportar":
             return self.exportar({k: v[0] for k, v in urllib.parse.parse_qs(url.query).items()})
+        if url.path == "/conversao":
+            qv = urllib.parse.parse_qs(url.query)
+            cid = qv.get("conv", [""])[0]
+            nome = next((x["nome"] for x in FEED if x["id"] == cid), qv.get("nome", [""])[0])
+            try:
+                c = conversao(nome)
+                lang = idioma(cid) if RE_CONV.match(cid) else "pt"
+                corpo = {"texto": conversao_texto(c, lang), "tabela": conversao_tabela(c), "escopo": c["escopo"]}
+            except Exception as e:
+                corpo = {"erro": str(e)}
+            dados = json.dumps(corpo, ensure_ascii=False).encode()
+            self.send_response(200 if "erro" not in corpo else 502)
+            self.send_header("content-type", "application/json; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(dados)
+            return
         if url.path == "/novidades":
             desde = float(urllib.parse.parse_qs(url.query).get("desde", ["0"])[0] or 0)
             ev = [{"t": t, "conv": c, "nome": n, "texto": x} for t, c, n, x in EVENTOS if t > desde]
@@ -2082,7 +2159,7 @@ No iPhone pelo controle remoto, o Safari não permite notificação fora da pág
             linhas.append([html.escape(x.get("tenantName", "")), html.escape(str(num(h.get("generated")))), html.escape(str(num(h.get("paid")))),
                            f'{h.get("successRate", "—")}%', f'{h.get("avgSecondsToPay", "—")}s'])
         self._pg("Dashboard", "/dashboard", f"""<h2>Dashboard</h2><p class=meta>Atualizado {hora(d.get("generatedAt"))} · rodando agora: {rodando or "—"}</p>
-<div class=tiles>{t}</div><h3>Cobranças hoje por tenant</h3>{tabela(["Tenant", "Geradas", "Pagas", "Conversão", "Tempo médio"], linhas)}""", filtro)
+<div class=tiles>{t}</div><h3>Conversão por tempo (hoje)</h3>{conversao_tabela(conversao())}<h3>Cobranças hoje por tenant</h3>{tabela(["Tenant", "Geradas", "Pagas", "Conversão", "Tempo médio"], linhas)}""", filtro)
 
     def saques(self, qs, filtro):
         q = qs.get("q", "").strip()
@@ -2213,6 +2290,12 @@ fetch('/c/{cid}/anteriores?antes='+b.dataset.antes).then(r=>r.text().then(h=>[h,
   let c=document.getElementById('c'),alt=c.scrollHeight;b.insertAdjacentHTML('afterend',h);
   if(ant&&h.trim()){{b.dataset.antes=ant;b.disabled=false;b.textContent='⬆️ Carregar mensagens anteriores';c.prepend(b)}}else b.remove();
   c.scrollTop+=c.scrollHeight-alt}}).catch(()=>{{b.disabled=false;b.textContent='Falhou, tentar de novo'}})}}
+function verConversao(b){{b.disabled=true;b.textContent='📊 calculando…';sujo=true;
+fetch('/conversao?conv={cid}&nome='+encodeURIComponent({json.dumps(nome)})).then(r=>r.json()).then(d=>{{
+  b.disabled=false;b.textContent='📊 Conversão';
+  if(d.erro){{document.getElementById('convbox').textContent='Falhou: '+d.erro;return}}
+  document.getElementById('convbox').innerHTML=d.tabela;document.getElementById('txc').value=d.texto}})
+.catch(()=>{{b.disabled=false;b.textContent='📊 Conversão'}})}}
 function semResposta(){{document.getElementById('rpl').value='';document.getElementById('rplv').style.display='none'}}
 function acaoMsg(corpo){{return fetch('/',{{method:'POST',headers:{{'content-type':'application/x-www-form-urlencoded'}},body:'t={TOKEN}&conv={cid}&'+corpo}})
 .then(r=>{{if(!r.ok)return r.text().then(t=>alert('Falhou: '+t.replace(/<[^>]+>/g,'').slice(0,200)));location.reload()}})}}
@@ -2225,6 +2308,7 @@ function apagarMsg(id){{if(confirm('Apagar esta mensagem? Ela some para o client
   {seletor_idioma(cid, idioma(cid, hist), cid, f)}
   <div class=lbls>{rapidas_html("txc", idioma(cid, hist))}</div>
   <div id=rplv class=cit style="display:none">↩︎ Respondendo: <span></span> <button type=button class=sec onclick="semResposta()">✕</button></div>
+  <div class=corr><button type=button class=sec onclick="verConversao(this)">📊 Conversão</button></div><div id=convbox></div>
   <textarea name=texto id=txc rows=4 spellcheck=true lang=pt-BR placeholder="Escreva a mensagem…"></textarea>{botao_corrigir("txc")}
   <label class=anexar>📎 Anexar <input type=file name=arquivo multiple onchange="document.getElementById('anx').textContent=[...this.files].map(f=>f.name).join(', ');sujo=true"></label>
   <span id=anx class=meta></span>
