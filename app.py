@@ -396,7 +396,8 @@ def db():
     # insights
     c.execute("create table if not exists msgs(id text primary key, conv text, nome_conv text, ts real, tipo text, meu int)")
     c.execute("create table if not exists ativo(minuto integer primary key)")
-    c.execute("create table if not exists acoes(ts real, tipo text, conv text)")  # sessao='__ligado__' = flag
+    c.execute("create table if not exists acoes(ts real, tipo text, conv text)")
+    c.execute("create table if not exists ignorados(conv text primary key, nome text, desde real)")  # sessao='__ligado__' = flag
     if "nome" not in [r[1] for r in c.execute("pragma table_info(rascunhos)")]:
         c.execute("alter table rascunhos add column nome text")
     return c
@@ -801,7 +802,13 @@ def vigia():
                 raise
             atualizar_feed(conversas)
             coletar_insights(conversas)
+            ign = ignorados()
             for conv, msg_id, nome, quando in novas_mensagens(conversas, vistos):
+                if conv in ign:
+                    vistos.add(msg_id)
+                    with db() as c:
+                        c.execute("insert or ignore into vistos values(?)", (msg_id,))
+                    continue
                 if quando >= corte:
                     try:
                         avisar(conv, nome, eh_n2(nome))
@@ -882,7 +889,7 @@ button{background:var(--ac);color:#fff;border:0;border-radius:8px;padding:9px 18
 .grid{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:20px}
 .grid>div{min-width:0}
 .feed{background:var(--card);border-radius:10px;padding:12px;font-size:13px;align-self:start;position:sticky;top:12px;max-height:90vh;overflow:auto}
-.fi{display:block;padding:7px 0;border-bottom:1px solid #2a2f39} .fi:last-child{border:0}
+.fi{display:block;position:relative;padding-right:34px!important;padding:7px 0;border-bottom:1px solid #2a2f39} .fi:last-child{border:0}
 .fi .t{color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis} .fi.in .n{color:var(--in)}
 .n2{background:#7c5cff;color:#fff;border-radius:9px;padding:0 6px;font-size:11px;margin-left:4px}
 .idi{margin:8px 0 0} .idi select{background:#0c0e12;color:var(--tx);border:1px solid #2a2f39;border-radius:8px;padding:5px 8px;font:inherit}
@@ -920,6 +927,10 @@ input[type=time]{background:#0c0e12;color:var(--tx);border:1px solid #2a2f39;bor
 .lbls{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:8px;margin:10px 0 0}
 .lbl{background:#232834;color:#e8ecf3;border:1px solid #3a4253;border-radius:8px;padding:9px 12px;font-weight:600;font-size:14px;text-align:left}
 .lbl:hover{background:#2e3546;border-color:#5a6680} .lbl.on{background:var(--ac);color:#fff;border-color:#6aa1ff;box-shadow:0 0 0 2px #2f7cf655}
+.ign{position:absolute;right:0;top:6px;width:28px;height:28px;display:flex;align-items:center;justify-content:center;border-radius:7px;
+font-size:14px;opacity:.35;cursor:pointer} .fi:hover .ign{opacity:1;background:#232834} .fi.off{opacity:.55}
+.igl{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid #2a2f39}
+@media (max-width:820px){.ign{opacity:.8}}
 .badge{background:var(--in);color:#000;border-radius:9px;padding:0 6px;font-size:11px;margin-left:4px}
 .filtro{display:flex;gap:6px;margin:8px 0} .filtro a{padding:3px 10px;border-radius:12px;background:#0c0e12;color:var(--mut)}
 .filtro a.on{background:var(--ac);color:#fff}
@@ -993,6 +1004,10 @@ let ultInteracao=Date.now();['mousemove','keydown','touchstart','click','scroll'
 setInterval(()=>{{if(document.visibilityState==='visible'&&Date.now()-ultInteracao<180000)fetch('/ping',{{method:'POST'}}).catch(()=>{{}})}},60000);
 function ativarNotif(b){{if(!window.Notification){{b.textContent='Este navegador não suporta';return}}
   Notification.requestPermission().then(p=>{{b.textContent=p==='granted'?'✅ Notificações ativadas':'Bloqueado: libere nas configurações do navegador';bip()}})}}
+function ignorarConv(id,nome,sim){{
+  if(sim&&!confirm('Ignorar "'+nome+'"? Não vai mais gerar card nem aviso. Dá para desfazer pelo 🔔 (filtro Todas) ou em 🔧.'))return;
+  fetch('/',{{method:'POST',headers:{{'content-type':'application/x-www-form-urlencoded'}},
+    body:'t={TOKEN}&acao=ignorar&conv='+id+'&sim='+sim+'&nome='+encodeURIComponent(nome)}}).then(()=>location.reload())}}
 function traduzir(b){{b.disabled=true;b.textContent='🌐 traduzindo…';sujo=true;
 fetch('/traduzir',{{method:'POST',headers:{{'content-type':'application/x-www-form-urlencoded'}},
 body:'t={TOKEN}&texto='+encodeURIComponent(b.dataset.t)}}).then(r=>r.text()).then(t=>{{
@@ -1098,14 +1113,35 @@ def badge_status(st):
 def feed_html(filtro="novas"):
     if not FEED:
         return "<p class=vazio>Aguardando o vigia…</p>"
-    itens = [f for f in FEED if filtro != "novas" or f["tipo"] == "incoming"]
+    ign = ignorados()
+    itens = [f for f in FEED if filtro != "novas" or (f["tipo"] == "incoming" and f["id"] not in ign)]
     if not itens:
         return "<p class=vazio>Nenhuma conversa aguardando resposta.</p>"
-    return "".join(fi_html(f, filtro) for f in itens[:40])
+    return "".join(fi_html(f, filtro, ign) for f in itens[:40])
 
 
-def fi_html(f, filtro):
-    return (f'<a href="/c/{html.escape(f["id"])}?f={filtro}" class="fi {"in" if f["tipo"] == "incoming" else ""}"><span class=n>{html.escape(f["nome"])}</span>'
+def ignorados():
+    with db() as c:
+        return dict(c.execute("select conv, nome from ignorados").fetchall())
+
+
+def ignorar(conv, nome, sim=True):
+    with db() as c:
+        if sim:
+            c.execute("insert or replace into ignorados values(?,?,?)", (conv, nome, time.time()))
+        else:
+            c.execute("delete from ignorados where conv=?", (conv,))
+
+
+def fi_html(f, filtro, ign=None):
+    ign = ignorados() if ign is None else ign
+    off = f["id"] in ign
+    nome_js = html.escape(json.dumps(f["nome"]), quote=True)
+    bt = (f'<span class=ign role=button title="{"Voltar a acompanhar" if off else "Ignorar este grupo: sem cards nem avisos"}" '
+          f'onclick="event.preventDefault();event.stopPropagation();ignorarConv(\'{html.escape(f["id"])}\',{nome_js},{0 if off else 1})">'
+          f'{"🔔" if off else "🔕"}</span>')
+    return (f'<a href="/c/{html.escape(f["id"])}?f={filtro}" class="fi {"in" if f["tipo"] == "incoming" else ""}{" off" if off else ""}">{bt}<span class=n>{html.escape(f["nome"])}</span>'
+            f'{"<span class=sb>ignorado</span>" if off else ""}'
             f'{"<span class=n2>N2</span>" if eh_n2(f["nome"]) else ""}'
             f'{"<span class=sb ok>concluída</span>" if f.get("status") == "resolved" else ""}'
             f'{"<span class=badge>" + str(f["pendente"]) + "</span>" if f["pendente"] else ""}'
@@ -1715,8 +1751,18 @@ No iPhone pelo controle remoto, o Safari não permite notificação fora da pág
 <button name=acao value=config_renovar>Renovar sessões agora</button></form>
 <p class=meta>Se cair de vez, rode no terminal: <code>uv run renovar.py login</code></p></div>
 
+<div class=card><h3>🔕 Conversas ignoradas</h3>{self.ignorados_html(T)}</div>
+
 <div class=card id=remoto><h3>📡 Controle remoto (celular)</h3>{self.remoto_html()}</div>"""
         self._html(pagina("Configurações", corpo, filtro, recarregar=False))
+
+    def ignorados_html(self, T):
+        ign = ignorados()
+        if not ign:
+            return '<p class=meta>Nenhuma. Use o 🔕 no canto de uma conversa da lista para ignorar grupos fora do suporte.</p>'
+        return "".join(f'<form method=post class=igl>{T}<input type=hidden name=acao value=ignorar><input type=hidden name=sim value=0>'
+                       f'<input type=hidden name=conv value="{html.escape(c)}"><input type=hidden name=volta value="/config">'
+                       f'<span>{html.escape(n or c)}</span><button class=sec>🔔 Voltar a acompanhar</button></form>' for c, n in ign.items())
 
     def config_salvar(self, f):
         a = f.get("acao")
@@ -2049,6 +2095,15 @@ function apagarMsg(id){{if(confirm('Apagar esta mensagem? Ela some para o client
             if RE_CONV.match(cid):
                 salvar_idioma(cid, f.get("lang", ""))
             return self._ir(f"/c/{volta}?f={filtro}" if RE_CONV.match(volta) else f"/?f={filtro}")
+        if acao == "ignorar":
+            cid = f.get("conv", "")
+            if not RE_CONV.match(cid):
+                return self._html("conversa inválida", 400)
+            ignorar(cid, f.get("nome", "")[:120], f.get("sim") == "1")
+            if f.get("sim") == "1":
+                with db() as c:  # tira da fila o que já estava pendente desse grupo
+                    c.execute("update rascunhos set status='descartado' where conversa=? and status='pendente'", (cid,))
+            return self._ir(f.get("volta") or f"/?f={filtro}") if f.get("volta") else self._html("ok")
         if acao in ("editar_msg", "apagar_msg", "status"):
             cid, mid = f.get("conv", ""), f.get("msg", "")
             if not RE_CONV.match(cid) or (acao != "status" and not RE_CONV.match(mid)):
