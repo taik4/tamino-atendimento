@@ -173,6 +173,7 @@ O tráfego é HTTP, sem criptografia, e só passa pela rede local. Use apenas em
 | Rascunho com "Texto padrão" | A IA falhou. Confira se o `claude` está logado ou se a `ANTHROPIC_API_KEY` é válida |
 | Celular não conecta | Controle remoto desligado, porta 8766 bloqueada no firewall ou celular fora do Wi-Fi |
 | Exportar PDF falha | Rode `uv run playwright install chromium` |
+| Áudio não toca | Instale o **ffmpeg** (Linux: pelo gerenciador de pacotes; Windows: `winget install ffmpeg`). Sem ele, o Safari/iPhone não toca o OGG do WhatsApp |
 | 403 em Saques/Provedores | O perfil de suporte não tem acesso; peça ao N2 |
 
 ---
