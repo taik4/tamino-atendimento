@@ -120,6 +120,43 @@ def tamino_lookup(ident):
     }))
 
 
+def tamino_post(path, corpo=None, timeout=30):
+    """POST no admin do Tamino (o backoffice exige X-Csrf-Token = cookie gw_csrf). Usado só para reenviar convite."""
+    def go():
+        ck = os.environ.get("TAMINO_COOKIE", "")
+        m = re.search(r"gw_csrf=([^;]+)", ck)
+        req = urllib.request.Request(TAMINO_API() + path, method="POST", data=json.dumps(corpo or {}).encode(), headers={
+            "accept": "application/json", "content-type": "application/json", "user-agent": "curl/8.10.0",
+            "cookie": ck, "origin": TAMINO_WEB(), "referer": TAMINO_WEB() + "/", "x-csrf-token": m.group(1) if m else ""})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read() or b"null")
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                raise AuthErro(f"{path}: sessão expirada (HTTP 401).")
+            raise RuntimeError(f"HTTP {e.code}: {e.read()[:200].decode('utf-8', 'replace')}")
+    return com_renovacao(go)
+
+
+_CONVITES = {"t": 0, "dados": []}
+
+
+def convites(fresco=False):
+    if fresco or time.time() - _CONVITES["t"] > 60:
+        _CONVITES.update(t=time.time(), dados=tamino_get("/admin/tenant-invites", timeout=40) or [])
+    return _CONVITES["dados"]
+
+
+def convite_por_email(email):
+    """Convite mais recente desse e-mail (pendente/expirado primeiro)."""
+    e = (email or "").strip().lower()
+    achados = sorted((c for c in convites() if (c.get("email") or "").lower() == e), key=lambda c: c.get("createdAt") or "", reverse=True)
+    return next((c for c in achados if c.get("status") != "redeemed"), achados[0] if achados else None)
+
+
+RE_EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+
 def tamino_get(path, timeout=20):
     """GET só leitura no admin do Tamino."""
     url = TAMINO_API() + path
@@ -1099,6 +1136,11 @@ function baterPonto(tipo,msg){{
   let avisar=confirm((tipo==='entrada'?'Entrar no serviço.':'Sair do serviço.')+'\\n\\nEnviar esta mensagem no grupo do N2?\\n\\n"'+msg+'"\\n\\nOK = registra e envia · Cancelar = só registra o horário');
   fetch('/',{{method:'POST',headers:{{'content-type':'application/x-www-form-urlencoded'}},
     body:'t={TOKEN}&acao=ponto&tipo='+tipo+'&avisar='+(avisar?1:0)}}).then(r=>r.ok?location.reload():r.text().then(t=>alert(t.replace(/<[^>]+>/g,''))))}}
+function reenviarConvite(id,email,b){{
+  if(!confirm('Reenviar o convite de acesso para '+email+'?\\n\\nO Tamino manda um novo e-mail de convite para esse endereço.'))return;
+  b.disabled=true;b.textContent='enviando…';
+  fetch('/',{{method:'POST',headers:{{'content-type':'application/x-www-form-urlencoded'}},body:'t={TOKEN}&acao=reenviar_convite&convite='+id}})
+  .then(r=>r.text().then(t=>{{if(r.ok){{b.textContent='✅ Reenviado'}}else{{b.disabled=false;b.textContent='↻ Reenviar';alert(t.replace(/<[^>]+>/g,''))}}}}))}}
 function traduzir(b){{b.disabled=true;b.textContent='🌐 traduzindo…';sujo=true;
 fetch('/traduzir',{{method:'POST',headers:{{'content-type':'application/x-www-form-urlencoded'}},
 body:'t={TOKEN}&texto='+encodeURIComponent(b.dataset.t)}}).then(r=>r.text()).then(t=>{{
@@ -1338,6 +1380,10 @@ RAPIDAS = [
         "en": "Here's our API documentation: https://docs.tamino.com.br\nTo get started, the Quick Start: https://docs.tamino.com.br/docs/quick-start\nAnd the full endpoint reference: https://api.tamino.com.br/v1/docs",
         "zh": "这是我们的API文档：https://docs.tamino.com.br\n快速入门：https://docs.tamino.com.br/docs/quick-start\n完整接口参考：https://api.tamino.com.br/v1/docs",
         "es": "Aquí está la documentación de la API: https://docs.tamino.com.br\nPara empezar, el Quick Start: https://docs.tamino.com.br/docs/quick-start\nY la referencia completa de endpoints: https://api.tamino.com.br/v1/docs"}),
+    ("📧 Pedir e-mail", {"pt": "Consegue me passar um e-mail para a gente enviar o convite de acesso?",
+                        "en": "Could you send me an email address so we can send you the access invite?",
+                        "zh": "能给我一个邮箱地址吗？我们会把访问邀请发给您。",
+                        "es": "¿Me pasas un e-mail para enviarte la invitación de acceso?"}),
     ("⏳ Segurar", {"pt": "Só um instante, estamos verificando.",
                    "en": "One moment, we're checking.",
                    "zh": "请稍等，我们正在核实。",
@@ -2135,6 +2181,24 @@ No iPhone pelo controle remoto, o Safari não permite notificação fora da pág
             return self.insights({k: v[0] for k, v in urllib.parse.parse_qs(url.query).items()}, filtro)
         if url.path == "/insights/exportar":
             return self.exportar({k: v[0] for k, v in urllib.parse.parse_qs(url.query).items()})
+        if url.path == "/convite-da-conversa":
+            cid = urllib.parse.parse_qs(url.query).get("conv", [""])[0]
+            try:
+                hist = evo_historico(cid) if RE_CONV.match(cid) else []
+                emails = []
+                for m in reversed(hist):
+                    if m["tipo"] == "incoming":
+                        emails += [e for e in RE_EMAIL.findall(m["texto"] or "") if e.lower() not in [x.lower() for x in emails]]
+                corpo = {"emails": emails[:5], "convites": [
+                    {"email": e, **({k: c.get(k) for k in ("id", "status", "expiresAt")} if (c := convite_por_email(e)) else {})} for e in emails[:5]]}
+            except Exception as e:
+                corpo = {"erro": str(e)}
+            dados = json.dumps(corpo, ensure_ascii=False).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(dados)
+            return
         if url.path == "/webhook-media":
             qv = urllib.parse.parse_qs(url.query)
             cid = qv.get("conv", [""])[0]
@@ -2294,7 +2358,25 @@ No iPhone pelo controle remoto, o Safari não permite notificação fora da pág
         self._pg("Usuários", "/usuarios", "<h2>Usuários</h2>" + filtros_html([("search", "Buscar nome ou e-mail…", None)], val,
                  f'<input type=hidden name=f value="{html.escape(filtro)}">')
                  + tabela(["Nome", "E-mail", "Papel", "Tenant", "Ativo", "MFA", "Último login"], linhas)
-                 + paginacao("/usuarios", {**val, "f": filtro}, pg, d.get("total", 0), por), filtro)
+                 + paginacao("/usuarios", {**val, "f": filtro}, pg, d.get("total", 0), por) + self.convites_html(qs, filtro), filtro)
+
+    def convites_html(self, qs, filtro):
+        busca = (qs.get("convite") or "").strip().lower()
+        try:
+            cs = convites(fresco=bool(qs.get("atualizar")))
+        except Exception as e:
+            return f"<h3>✉️ Convites</h3><p>Falhou: {html.escape(str(e))}</p>"
+        cs = sorted((c for c in cs if not busca or busca in (c.get("email") or "").lower()), key=lambda c: c.get("createdAt") or "", reverse=True)
+        st = {"pending": "pendente", "expired": "expirado", "redeemed": "aceito"}
+        linhas = []
+        for c in cs[:40]:
+            bt = (f'<button type=button class=sec onclick="reenviarConvite(\'{html.escape(c["id"])}\',\'{html.escape(c.get("email") or "")}\',this)">↻ Reenviar</button>'
+                  if c.get("status") != "redeemed" else "")
+            linhas.append([html.escape(c.get("email") or ""), f'<span class="sb {"ok" if c.get("status") == "redeemed" else ("er" if c.get("status") == "expired" else "")}">{st.get(c.get("status"), c.get("status"))}</span>',
+                           hora(c.get("createdAt")), hora(c.get("expiresAt")), bt])
+        return (f'<h3 id=convites>✉️ Convites</h3><form class=filtros action="/usuarios#convites"><input type=hidden name=f value="{html.escape(filtro)}">'
+                f'<input type=search name=convite value="{html.escape(busca)}" placeholder="Buscar convite por e-mail…"><button>Buscar</button></form>'
+                + tabela(["E-mail", "Status", "Criado", "Expira", ""], linhas))
 
     def taxas(self, q, filtro):
         ABA_ATUAL["Taxas"] = "/taxas"
@@ -2376,6 +2458,16 @@ fetch('/webhook-media?conv={cid}&nome='+encodeURIComponent({json.dumps(nome)})).
   if(d.erro){{document.getElementById('convbox').textContent='Falhou: '+d.erro;return}}
   document.getElementById('convbox').innerHTML=d.tabela;if(d.texto)document.getElementById('txc').value=d.texto}})
 .catch(()=>{{b.disabled=false;b.textContent='📨 Média webhook'}})}}
+function conviteDaConversa(b){{b.disabled=true;b.textContent='✉️ procurando…';
+fetch('/convite-da-conversa?conv={cid}').then(r=>r.json()).then(d=>{{b.disabled=false;b.textContent='✉️ Reenviar convite';
+  let box=document.getElementById('convbox');
+  if(d.erro){{box.textContent='Falhou: '+d.erro;return}}
+  if(!d.emails.length){{box.innerHTML='<p class=meta>Nenhum e-mail nas mensagens do cliente. Use 📧 Pedir e-mail ou procure em Usuários → ✉️ Convites.</p>';return}}
+  box.innerHTML=d.convites.map(c=>c.id
+    ?'<p>'+c.email+' · convite <b>'+({{pending:'pendente',expired:'expirado',redeemed:'já aceito'}}[c.status]||c.status)+'</b> '
+      +(c.status!=='redeemed'?'<button type=button class=sec data-id="'+c.id+'" data-email="'+c.email+'" onclick="reenviarConvite(this.dataset.id,this.dataset.email,this)">↻ Reenviar</button>':'')+'</p>'
+    :'<p>'+c.email+' · <span class=meta>nenhum convite com esse e-mail (criar convite é com o N2)</span></p>').join('')}})
+.catch(()=>{{b.disabled=false;b.textContent='✉️ Reenviar convite'}})}}
 function semResposta(){{document.getElementById('rpl').value='';document.getElementById('rplv').style.display='none'}}
 function acaoMsg(corpo){{return fetch('/',{{method:'POST',headers:{{'content-type':'application/x-www-form-urlencoded'}},body:'t={TOKEN}&conv={cid}&'+corpo}})
 .then(r=>{{if(!r.ok)return r.text().then(t=>alert('Falhou: '+t.replace(/<[^>]+>/g,'').slice(0,200)));location.reload()}})}}
@@ -2389,7 +2481,8 @@ function apagarMsg(id){{if(confirm('Apagar esta mensagem? Ela some para o client
   <div class=lbls>{rapidas_html("txc", idioma(cid, hist))}</div>
   <div id=rplv class=cit style="display:none">↩︎ Respondendo: <span></span> <button type=button class=sec onclick="semResposta()">✕</button></div>
   <div class=corr><button type=button class=sec onclick="verConversao(this)">📊 Conversão</button>
-  <button type=button class=sec onclick="verWebhook(this)">📨 Média webhook</button></div><div id=convbox></div>
+  <button type=button class=sec onclick="verWebhook(this)">📨 Média webhook</button>
+  <button type=button class=sec onclick="conviteDaConversa(this)">✉️ Reenviar convite</button></div><div id=convbox></div>
   <textarea name=texto id=txc rows=4 spellcheck=true lang=pt-BR placeholder="Escreva a mensagem…"></textarea>{botao_corrigir("txc")}
   <label class=anexar>📎 Anexar <input type=file name=arquivo multiple onchange="document.getElementById('anx').textContent=[...this.files].map(f=>f.name).join(', ');sujo=true"></label>
   <span id=anx class=meta></span>
@@ -2467,6 +2560,17 @@ function apagarMsg(id){{if(confirm('Apagar esta mensagem? Ela some para o client
             if RE_CONV.match(cid):
                 salvar_idioma(cid, f.get("lang", ""))
             return self._ir(f"/c/{volta}?f={filtro}" if RE_CONV.match(volta) else f"/?f={filtro}")
+        if acao == "reenviar_convite":
+            iid = f.get("convite", "")
+            if not RE_CONV.match(iid):
+                return self._html("convite inválido", 400)
+            try:
+                tamino_post(f"/admin/tenant-invites/{iid}/resend")
+                registrar_acao("reenviar_convite", f.get("conv", ""))
+                convites(fresco=True)
+            except Exception as e:
+                return self._html(f"Falhou ao reenviar: {html.escape(str(e))}", 502)
+            return self._html("ok")
         if acao == "ponto" and f.get("tipo") in ("entrada", "saida"):
             em, _ = ponto_atual()
             if (f["tipo"] == "entrada") == em:
