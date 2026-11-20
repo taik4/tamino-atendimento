@@ -1430,8 +1430,9 @@ def conversao_texto(c, lang):
 def conversao_tabela(c):
     linhas = [[f"até {lim} min", f"{v:.1f}%", f"{vp:.1f}%"] for lim, v, vp in c["faixas"]]
     titulo = "da conta do cliente" if c["escopo"] == "conta" else "geral da plataforma (cliente sem volume hoje)"
-    return (f'<div class=meta>Conversão hoje, {titulo}: {c["geradas"]:,} geradas · {c["pagas"]:,} pagas · '
-            f'total {c["taxa"] if c["taxa"] is not None else "—"}% · médio {c["medio"] or "—"}s</div>'.replace(",", ".")
+    mil = lambda n: f"{n:,}".replace(",", ".")
+    return (f'<div class=meta>Conversão hoje, {titulo}: {mil(c["geradas"])} geradas · {mil(c["pagas"])} pagas · '
+            f'total {c["taxa"] if c["taxa"] is not None else "—"}% · médio {c["medio"] or "—"}s</div>'
             + tabela(["Pago em", "% das geradas", "% das pagas"], linhas))
 
 
