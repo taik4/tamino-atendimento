@@ -1436,6 +1436,61 @@ def conversao_tabela(c):
             + tabela(["Pago em", "% das geradas", "% das pagas"], linhas))
 
 
+def webhook_stats(nome_conversa=""):
+    """Latência de entrega dos webhooks (criado -> entregue) nas 100 entregas mais recentes.
+    Usa o tenant do cliente se o nome da conversa casar com um tenant que tenha entregas; senão a plataforma."""
+    import statistics as st
+    nome_tenant("")  # carrega o mapa id -> nome
+    nc, tid = _alnum(nome_conversa), None
+    for i, n in _TENANTS["map"].items():
+        tn = _alnum(n)
+        if len(tn) >= 4 and tn in nc and (not tid or len(tn) > len(_alnum(_TENANTS["map"][tid]))):
+            tid = i
+    base = {"page": 1, "pageSize": 100}
+    d, escopo = {}, "plataforma"
+    if tid:
+        d, _ = webhooks_cache(urllib.parse.urlencode({**base, "tenantId": tid}))
+        escopo = "conta" if d.get("items") else "plataforma"
+    if not d.get("items"):
+        d, _ = webhooks_cache(urllib.parse.urlencode(base))
+    iso = lambda v: datetime.fromisoformat(v.replace("Z", "+00:00"))
+    itens = d.get("items") or []
+    ok = [x for x in itens if x.get("deliveredAt") and x.get("createdAt")]
+    dt = sorted((iso(x["deliveredAt"]) - iso(x["createdAt"])).total_seconds() for x in ok)
+    if not dt:
+        return {"escopo": escopo, "n": 0}
+    q = lambda pct: dt[min(len(dt) - 1, int(pct * len(dt)))]
+    return {"escopo": escopo, "n": len(itens), "entregues": len(ok), "media": st.mean(dt), "mediana": st.median(dt),
+            "p90": q(.9), "max": dt[-1], "primeira": 100 * sum(1 for x in ok if (x.get("attempts") or 1) <= 1) / len(ok),
+            "de": hora(min(x["createdAt"] for x in itens)), "ate": hora(max(x["createdAt"] for x in itens))}
+
+
+TXT_WH = {
+    "pt": "A média de entrega do webhook {escopo} tá em torno de {media} ms após o evento, e 90% chegam em até {p90} ms. {primeira}% são entregues na primeira tentativa.",
+    "en": "Average webhook delivery {escopo} is around {media} ms after the event, and 90% arrive within {p90} ms. {primeira}% are delivered on the first attempt.",
+    "zh": "{escopo}的webhook平均在事件发生后约{media}毫秒送达，90%在{p90}毫秒内到达。{primeira}%在第一次尝试时送达。",
+    "es": "El promedio de entrega del webhook {escopo} está en torno a {media} ms después del evento, y el 90% llega en hasta {p90} ms. El {primeira}% se entrega en el primer intento.",
+}
+ESCOPO_WH = {"pt": ("na sua conta", "na plataforma"), "en": ("on your account", "across the platform"),
+             "zh": ("您账户", "平台"), "es": ("en tu cuenta", "en la plataforma")}
+
+
+def webhook_texto(w, lang):
+    esc = ESCOPO_WH.get(lang, ESCOPO_WH["pt"])[0 if w["escopo"] == "conta" else 1]
+    arred = lambda seg: max(10, int(round(seg * 1000, -1)))
+    return TXT_WH.get(lang, TXT_WH["pt"]).format(escopo=esc, media=arred(w["media"]), p90=arred(w["p90"]), primeira=f"{w['primeira']:.0f}")
+
+
+def webhook_tabela(w):
+    if not w.get("n"):
+        return "<p class=vazio>Sem entregas recentes para calcular.</p>"
+    ms = lambda seg: f"{seg * 1000:.0f} ms"
+    titulo = "da conta do cliente" if w["escopo"] == "conta" else "geral da plataforma"
+    return (f'<div class=meta>Webhooks {titulo}: últimas {w["n"]} entregas ({w["de"]} → {w["ate"]})</div>'
+            + tabela(["Média", "Mediana", "90% até", "Máximo", "1ª tentativa"],
+                     [[ms(w["media"]), ms(w["mediana"]), ms(w["p90"]), ms(w["max"]), f'{w["primeira"]:.0f}%']]))
+
+
 def botao_corrigir(alvo):
     return (f'<div class=corr><button type=button class=sec onclick="corrigirTexto(\'{alvo}\',this)">✨ Corrigir</button>'
             f'<button type=button class="sec desf" style="display:none" onclick="desfazerCorr(\'{alvo}\',this)">↩︎ Desfazer</button></div>')
@@ -1520,6 +1575,8 @@ def aquecer_webhooks():
     while True:
         try:
             _WH[WH_PADRAO] = (time.time(), tamino_get("/admin/webhooks/deliveries?" + WH_PADRAO, timeout=90) or {})
+            q100 = urllib.parse.urlencode({"page": 1, "pageSize": 100})  # base do botão 📨 Média webhook
+            _WH[q100] = (time.time(), tamino_get("/admin/webhooks/deliveries?" + q100, timeout=120) or {})
         except Exception as e:
             print(f"[webhooks] erro: {e}", flush=True)
         time.sleep(60)
@@ -2078,6 +2135,22 @@ No iPhone pelo controle remoto, o Safari não permite notificação fora da pág
             return self.insights({k: v[0] for k, v in urllib.parse.parse_qs(url.query).items()}, filtro)
         if url.path == "/insights/exportar":
             return self.exportar({k: v[0] for k, v in urllib.parse.parse_qs(url.query).items()})
+        if url.path == "/webhook-media":
+            qv = urllib.parse.parse_qs(url.query)
+            cid = qv.get("conv", [""])[0]
+            nome = next((x["nome"] for x in FEED if x["id"] == cid), qv.get("nome", [""])[0])
+            try:
+                w = webhook_stats(nome)
+                lang = idioma(cid) if RE_CONV.match(cid) else "pt"
+                corpo = {"texto": webhook_texto(w, lang) if w.get("n") else "", "tabela": webhook_tabela(w)}
+            except Exception as e:
+                corpo = {"erro": str(e)}
+            dados = json.dumps(corpo, ensure_ascii=False).encode()
+            self.send_response(200 if "erro" not in corpo else 502)
+            self.send_header("content-type", "application/json; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(dados)
+            return
         if url.path == "/conversao":
             qv = urllib.parse.parse_qs(url.query)
             cid = qv.get("conv", [""])[0]
@@ -2297,6 +2370,12 @@ fetch('/conversao?conv={cid}&nome='+encodeURIComponent({json.dumps(nome)})).then
   if(d.erro){{document.getElementById('convbox').textContent='Falhou: '+d.erro;return}}
   document.getElementById('convbox').innerHTML=d.tabela;document.getElementById('txc').value=d.texto}})
 .catch(()=>{{b.disabled=false;b.textContent='📊 Conversão'}})}}
+function verWebhook(b){{b.disabled=true;b.textContent='📨 calculando… (até ~40s)';sujo=true;
+fetch('/webhook-media?conv={cid}&nome='+encodeURIComponent({json.dumps(nome)})).then(r=>r.json()).then(d=>{{
+  b.disabled=false;b.textContent='📨 Média webhook';
+  if(d.erro){{document.getElementById('convbox').textContent='Falhou: '+d.erro;return}}
+  document.getElementById('convbox').innerHTML=d.tabela;if(d.texto)document.getElementById('txc').value=d.texto}})
+.catch(()=>{{b.disabled=false;b.textContent='📨 Média webhook'}})}}
 function semResposta(){{document.getElementById('rpl').value='';document.getElementById('rplv').style.display='none'}}
 function acaoMsg(corpo){{return fetch('/',{{method:'POST',headers:{{'content-type':'application/x-www-form-urlencoded'}},body:'t={TOKEN}&conv={cid}&'+corpo}})
 .then(r=>{{if(!r.ok)return r.text().then(t=>alert('Falhou: '+t.replace(/<[^>]+>/g,'').slice(0,200)));location.reload()}})}}
@@ -2309,7 +2388,8 @@ function apagarMsg(id){{if(confirm('Apagar esta mensagem? Ela some para o client
   {seletor_idioma(cid, idioma(cid, hist), cid, f)}
   <div class=lbls>{rapidas_html("txc", idioma(cid, hist))}</div>
   <div id=rplv class=cit style="display:none">↩︎ Respondendo: <span></span> <button type=button class=sec onclick="semResposta()">✕</button></div>
-  <div class=corr><button type=button class=sec onclick="verConversao(this)">📊 Conversão</button></div><div id=convbox></div>
+  <div class=corr><button type=button class=sec onclick="verConversao(this)">📊 Conversão</button>
+  <button type=button class=sec onclick="verWebhook(this)">📨 Média webhook</button></div><div id=convbox></div>
   <textarea name=texto id=txc rows=4 spellcheck=true lang=pt-BR placeholder="Escreva a mensagem…"></textarea>{botao_corrigir("txc")}
   <label class=anexar>📎 Anexar <input type=file name=arquivo multiple onchange="document.getElementById('anx').textContent=[...this.files].map(f=>f.name).join(', ');sujo=true"></label>
   <span id=anx class=meta></span>
