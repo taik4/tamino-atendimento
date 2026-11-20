@@ -398,7 +398,8 @@ def db():
     c.execute("create table if not exists msgs(id text primary key, conv text, nome_conv text, ts real, tipo text, meu int)")
     c.execute("create table if not exists ativo(minuto integer primary key)")
     c.execute("create table if not exists acoes(ts real, tipo text, conv text)")
-    c.execute("create table if not exists ignorados(conv text primary key, nome text, desde real)")  # sessao='__ligado__' = flag
+    c.execute("create table if not exists ignorados(conv text primary key, nome text, desde real)")
+    c.execute("create table if not exists ponto(ts real, tipo text)")  # tipo: entrada | saida  # sessao='__ligado__' = flag
     if "nome" not in [r[1] for r in c.execute("pragma table_info(rascunhos)")]:
         c.execute("alter table rascunhos add column nome text")
     return c
@@ -661,6 +662,54 @@ def eh_n2(nome):
 
 def conv_n2():
     return next((f["id"] for f in FEED if eh_n2(f["nome"])), None)
+
+
+MSG_ENTRADA = "Boa noite, pessoal! {nome} entrando no turno agora ({hora}). 🟢"
+MSG_SAIDA = "Encerrando meu turno por aqui ({hora}). Boa noite, pessoal! 🔴"
+
+
+def ponto_atual():
+    """(em_servico, ts da última entrada ou None)."""
+    with db() as c:
+        r = c.execute("select ts, tipo from ponto order by ts desc limit 1").fetchone()
+    return (True, r[0]) if r and r[1] == "entrada" else (False, None)
+
+
+def bater_ponto(tipo):
+    with db() as c:
+        c.execute("insert into ponto values(?,?)", (time.time(), tipo))
+
+
+def msg_ponto(tipo):
+    modelo = cfg("msg_entrada" if tipo == "entrada" else "msg_saida", MSG_ENTRADA if tipo == "entrada" else MSG_SAIDA)
+    return modelo.replace("{nome}", cfg("atendente", "Suporte")).replace("{hora}", datetime.now(TZ).strftime("%H:%M"))
+
+
+def minutos_ponto(t0, t1):
+    """Minutos em serviço (entrada→saída) dentro de [t0, t1); turno aberto conta até agora."""
+    with db() as c:
+        regs = c.execute("select ts, tipo from ponto order by ts").fetchall()
+    total, ini = 0.0, None
+    for ts, tipo in regs + [(time.time(), "saida")]:
+        if tipo == "entrada" and ini is None:
+            ini = ts
+        elif tipo == "saida" and ini is not None:
+            a, b = max(ini, t0), min(ts, t1)
+            total += max(0, b - a)
+            ini = None
+    return int(total // 60)
+
+
+def ponto_html():
+    em, desde = ponto_atual()
+    msg = html.escape(msg_ponto("saida" if em else "entrada"), quote=True)
+    if em:
+        h = datetime.fromtimestamp(desde, TZ).strftime("%H:%M")
+        return (f'<div class="ponto on"><span>🟢 Em serviço desde <b>{h}</b> · <b class=crono data-desde="{desde}">00:00:00</b></span>'
+                f'<button type=button onclick="baterPonto(\'saida\',this.dataset.m)" data-m="{msg}">⏹ Sair</button></div>')
+    ini, fim = turno()
+    return (f'<div class=ponto><span>⚪ Fora de serviço · turno {ini.strftime("%H:%M")}–{fim.strftime("%H:%M")}</span>'
+            f'<button type=button onclick="baterPonto(\'entrada\',this.dataset.m)" data-m="{msg}">▶ Entrar</button></div>')
 STATUS = {}  # nome -> (ok, quando, msg), mostrado no topo do painel
 
 
@@ -924,6 +973,10 @@ button{background:var(--ac);color:#fff;border:0;border-radius:8px;padding:9px 18
 .fab{position:fixed;right:18px;bottom:18px;z-index:20;width:54px;height:54px;border-radius:50%;display:flex;align-items:center;justify-content:center;
 font-size:24px;background:#232834;border:1px solid #3a4253;box-shadow:0 6px 20px #0008} .fab:hover{background:#2e3546}
 table.rap textarea{min-width:160px;font-family:inherit;font-size:13px}
+.ponto{margin-left:auto;display:flex;align-items:center;gap:8px;background:var(--card);border:1px solid #2a2f39;border-radius:12px;padding:6px 8px 6px 12px;font-size:13px;color:var(--mut)}
+.ponto b{color:var(--tx)} .ponto.on{border-color:#1f7a52} .ponto .crono{font-variant-numeric:tabular-nums}
+.ponto button{padding:6px 12px;font-size:13px} .ponto.on button{background:#5a2323}
+@media (max-width:820px){.marca{flex-wrap:wrap} .ponto{margin-left:0;width:100%;justify-content:space-between}}
 .marca{display:flex;align-items:center;gap:10px;margin:0 0 10px} .marca img{width:44px;height:44px}
 .marca span{font-size:17px;color:var(--mut)} .marca b{color:var(--tx)}
 .anexos{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 2px} .ax{max-width:220px;max-height:220px;border-radius:8px;display:block}
@@ -1038,6 +1091,13 @@ function corrigirTexto(id,b){{let t=document.getElementById(id);if(!t.value.trim
     if(x===antesCorr[id])b.textContent='✅ Sem erros'}})
   .catch(()=>{{b.disabled=false;b.textContent='Falhou, tentar de novo'}})}}
 function desfazerCorr(id,b){{document.getElementById(id).value=antesCorr[id]||'';b.style.display='none'}}
+function crono(){{document.querySelectorAll('.crono').forEach(e=>{{let s=Math.max(0,Math.floor(Date.now()/1000-e.dataset.desde));
+  e.textContent=[s/3600,s%3600/60,s%60].map(v=>String(Math.floor(v)).padStart(2,'0')).join(':')}})}}
+addEventListener('DOMContentLoaded',()=>{{crono();setInterval(crono,1000)}});
+function baterPonto(tipo,msg){{
+  let avisar=confirm((tipo==='entrada'?'Entrar no serviço.':'Sair do serviço.')+'\\n\\nEnviar esta mensagem no grupo do N2?\\n\\n"'+msg+'"\\n\\nOK = registra e envia · Cancelar = só registra o horário');
+  fetch('/',{{method:'POST',headers:{{'content-type':'application/x-www-form-urlencoded'}},
+    body:'t={TOKEN}&acao=ponto&tipo='+tipo+'&avisar='+(avisar?1:0)}}).then(r=>r.ok?location.reload():r.text().then(t=>alert(t.replace(/<[^>]+>/g,''))))}}
 function traduzir(b){{b.disabled=true;b.textContent='🌐 traduzindo…';sujo=true;
 fetch('/traduzir',{{method:'POST',headers:{{'content-type':'application/x-www-form-urlencoded'}},
 body:'t={TOKEN}&texto='+encodeURIComponent(b.dataset.t)}}).then(r=>r.text()).then(t=>{{
@@ -1053,7 +1113,7 @@ addEventListener('DOMContentLoaded',()=>{{
 <script>/* recarrega a cada 10s (só fila/conversas), menos enquanto você edita um texto */
 let sujo=false;addEventListener('input',()=>sujo=true);
 if({'true' if recarregar else 'false'})setInterval(()=>{{if(!sujo&&!document.activeElement.matches('textarea'))location.reload()}},10000)</script>
-<style>{CSS}</style><a class=fab href="/config?f={html.escape(filtro)}" title="Configurações">🔧</a><div class=marca><img src="/static/logo-256.png?v=2" alt=""><span>Atendimento <b>Tamino</b></span></div>{status_html()}{abas(titulo, filtro)}
+<style>{CSS}</style><a class=fab href="/config?f={html.escape(filtro)}" title="Configurações">🔧</a><div class=marca><img src="/static/logo-256.png?v=2" alt=""><span>Atendimento <b>Tamino</b></span>{ponto_html()}</div>{status_html()}{abas(titulo, filtro)}
 <div class=grid><div>{principal}</div>
 <div class=feed><b>Conversas</b>
 <form action=/buscar class=busca><input type=search name=q placeholder="🔎 Buscar conversa…"><input type=hidden name=f value="{html.escape(filtro)}"></form>
@@ -1507,7 +1567,7 @@ def calcular_insights(de, ate):
             dias[d]["ativo_min"] += 1
     respostas.sort()
     return {"enviadas": len(envios), "recebidas": len(recebidas), "atendidas": len(top), "ativo_min": len(minutos),
-            "concluidas": concl, "resp_mediana": respostas[len(respostas) // 2] if respostas else None,
+            "servico_min": minutos_ponto(t0, t1), "concluidas": concl, "resp_mediana": respostas[len(respostas) // 2] if respostas else None,
             "dias": [{"dia": d, **v} for d, v in dias.items()], "por_hora": [(h, por_hora[h]) for h in horas_turno],
             "top": sorted(([v[0], v[1], v[2]] for v in top.values()), key=lambda x: -x[1])[:10],
             "desde": datetime.fromtimestamp(desde, TZ).strftime("%d/%m/%Y") if desde else "o próximo envio pelo painel"}
@@ -1740,7 +1800,8 @@ ligue só em rede confiável. Desligar desconecta todos os celulares.</p>"""
 <p><a class=btn href="/insights/exportar?fmt=pdf&{q}">⬇️ Exportar PDF</a> <a class=btn href="/insights/exportar?fmt=jpg&{q}">⬇️ Exportar JPEG</a></p>"""
         tiles = [("Atendimentos", d["atendidas"], "conversas respondidas pelo painel"), ("Mensagens enviadas", d["enviadas"], "pelo painel"),
                  ("Mensagens recebidas", d["recebidas"], "dos clientes, todas as conversas"), ("Tempo ativo", horas(d["ativo_min"]), "painel em uso"),
-                 ("1ª resposta (mediana)", tempo_fmt(d["resp_mediana"]), "do cliente até você"), ("Concluídas no painel", d["concluidas"], "conversas")]
+                 ("1ª resposta (mediana)", tempo_fmt(d["resp_mediana"]), "do cliente até você"), ("Concluídas no painel", d["concluidas"], "conversas"),
+                 ("Em serviço", horas(d["servico_min"]), "pelo ponto ▶/⏹")]
         t = "".join(f"<div class=tile><span>{n}</span><b>{html.escape(str(v))}</b><span>{x}</span></div>" for n, v, x in tiles)
         dias = d["dias"]
         corpo = f"""<div class=insights><h2>📈 Meus insights</h2>
@@ -1813,6 +1874,12 @@ No iPhone pelo controle remoto, o Safari não permite notificação fora da pág
 <p class=meta>Usado na saudação ("Sou o … do suporte") e no relatório de Insights.</p>
 <button name=acao value=config_nome>Salvar</button></form></div>
 
+<div class=card><h3>⏱️ Ponto e avisos no N2</h3><form method=post>{T}
+<p class=meta>Mensagem ao entrar</p><textarea name=msg_entrada rows=2 spellcheck=true lang=pt-BR>{html.escape(cfg("msg_entrada", MSG_ENTRADA))}</textarea>
+<p class=meta>Mensagem ao sair</p><textarea name=msg_saida rows=2 spellcheck=true lang=pt-BR>{html.escape(cfg("msg_saida", MSG_SAIDA))}</textarea>
+<p class=meta>Use <code>{{nome}}</code> e <code>{{hora}}</code> para preencher sozinho. Ao clicar em ▶ Entrar / ⏹ Sair (canto superior direito) o painel pergunta se envia no grupo do N2.</p>
+<button name=acao value=config_ponto>Salvar</button></form></div>
+
 <div class=card><h3>🕗 Horário de trabalho</h3><form method=post>{T}
 <p>Das <input type=time name=turno_inicio value="{cfg("turno_inicio", "20:00")}"> às <input type=time name=turno_fim value="{cfg("turno_fim", "04:00")}"></p>
 <p class=meta>Os Insights contam por turno: o turno de 19/11 vai das 20:00 de 19/11 às 04:00 de 20/11. O que acontece fora do expediente não entra.</p>
@@ -1856,6 +1923,11 @@ No iPhone pelo controle remoto, o Safari não permite notificação fora da pág
             cfg_salvar(rascunho_auto="1" if f.get("rascunho_auto") == "1" else "0")
         elif a == "config_nome" and f.get("atendente", "").strip():
             cfg_salvar(atendente=f["atendente"].strip()[:40])
+        elif a == "config_ponto":
+            if f.get("msg_entrada", "").strip():
+                cfg_salvar(msg_entrada=f["msg_entrada"].strip()[:500])
+            if f.get("msg_saida", "").strip():
+                cfg_salvar(msg_saida=f["msg_saida"].strip()[:500])
         elif a == "config_turno":
             ok = lambda v: bool(re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", v or ""))
             if ok(f.get("turno_inicio")) and ok(f.get("turno_fim")):
@@ -2230,6 +2302,21 @@ function apagarMsg(id){{if(confirm('Apagar esta mensagem? Ela some para o client
             if RE_CONV.match(cid):
                 salvar_idioma(cid, f.get("lang", ""))
             return self._ir(f"/c/{volta}?f={filtro}" if RE_CONV.match(volta) else f"/?f={filtro}")
+        if acao == "ponto" and f.get("tipo") in ("entrada", "saida"):
+            em, _ = ponto_atual()
+            if (f["tipo"] == "entrada") == em:
+                return self._html("ok")  # já está nesse estado (clique duplo)
+            bater_ponto(f["tipo"])
+            if f.get("avisar") == "1":
+                n2 = conv_n2()
+                if not n2:
+                    return self._html(f"Ponto registrado, mas não achei o grupo N2 ({html.escape(cfg('grupo_n2', ''))}) para avisar.", 502)
+                try:
+                    evo_enviar(n2, msg_ponto(f["tipo"]))
+                    registrar_acao("aviso_ponto", n2)
+                except Exception as e:
+                    return self._html(f"Ponto registrado, mas o aviso no N2 falhou: {html.escape(str(e))}", 502)
+            return self._html("ok")
         if acao == "ignorar":
             cid = f.get("conv", "")
             if not RE_CONV.match(cid):
@@ -2380,6 +2467,7 @@ abd4161e-c248-48bb-a38c-1fdad3fd7e4b
     ts = lambda d, h, m=0: datetime(2026, 11, d, h, m, tzinfo=TZ).timestamp()
     assert dia_turno(ts(19, 20)) == date(2026, 11, 19) and dia_turno(ts(20, 3, 59)) == date(2026, 11, 19)
     assert dia_turno(ts(20, 4)) is None and dia_turno(ts(20, 15)) is None and dia_turno(ts(20, 23)) == date(2026, 11, 20)
+    assert "{" not in msg_ponto("entrada")
     assert fmt_taxa({"percentageBps": 460}) == "4,60%"
     assert fmt_taxa({"percentageBps": 500, "fixedAmountInCents": 200, "minAmountInCents": 50}) == "5,00% + R$ 2,00 (mín R$ 0,50)"
     assert fmt_taxa({"percentageBps": 0, "fixedAmountInCents": 0}) == "0"
