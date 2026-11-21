@@ -120,12 +120,12 @@ def tamino_lookup(ident):
     }))
 
 
-def tamino_post(path, corpo=None, timeout=30):
-    """POST no admin do Tamino (o backoffice exige X-Csrf-Token = cookie gw_csrf). Usado só para reenviar convite."""
+def tamino_post(path, corpo=None, timeout=30, metodo="POST"):
+    """POST/PUT no admin do Tamino (o backoffice exige X-Csrf-Token = cookie gw_csrf). Convites e tarifas."""
     def go():
         ck = os.environ.get("TAMINO_COOKIE", "")
         m = re.search(r"gw_csrf=([^;]+)", ck)
-        req = urllib.request.Request(TAMINO_API() + path, method="POST", data=json.dumps(corpo or {}).encode(), headers={
+        req = urllib.request.Request(TAMINO_API() + path, method=metodo, data=json.dumps(corpo or {}).encode(), headers={
             "accept": "application/json", "content-type": "application/json", "user-agent": "curl/8.10.0",
             "cookie": ck, "origin": TAMINO_WEB(), "referer": TAMINO_WEB() + "/", "x-csrf-token": m.group(1) if m else ""})
         try:
@@ -1034,6 +1034,9 @@ table.rap textarea{min-width:160px;font-family:inherit;font-size:13px}
 .ponto b{color:var(--tx)} .ponto.on{border-color:#1f7a52} .ponto .crono{font-variant-numeric:tabular-nums}
 .ponto button{padding:6px 12px;font-size:13px} .ponto.on button{background:#5a2323}
 @media (max-width:820px){.marca{flex-wrap:wrap} .ponto{margin-left:0;width:100%;justify-content:space-between}}
+.ok-msg{background:#1f4d3d;color:#9ff0cf;padding:8px 12px;border-radius:8px}
+.taxgrid{display:grid;grid-template-columns:1fr 1fr;gap:12px} .taxf input[type=number]{width:90px;background:#0c0e12;color:var(--tx);border:1px solid #2a2f39;border-radius:8px;padding:6px 8px;font:inherit}
+@media (max-width:820px){.taxgrid{grid-template-columns:1fr}}
 .marca{display:flex;align-items:center;gap:10px;margin:0 0 10px} .marca img{width:44px;height:44px}
 .marca span{font-size:17px;color:var(--mut)} .marca b{color:var(--tx)}
 .anexos{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 2px} .ax{max-width:220px;max-height:220px;border-radius:8px;display:block}
@@ -2519,14 +2522,57 @@ No iPhone pelo controle remoto, o Safari não permite notificação fora da pág
         exemplos = lambda k: ", ".join(f'{brl(x["amountInCents"])} → {brl(x["feeInCents"])}' for x in (d.get("examples") or {}).get(k, []))
         piso = mgr.get("floor") or {}
         self._html(pagina(d.get("tenantName", "Taxas"), f"""<p class=meta><a href="/taxas?f={html.escape(filtro)}">← Taxas</a></p>
-<h2>{html.escape(d.get("tenantName") or tid)}</h2>
+<h2>{html.escape(d.get("tenantName") or tid)}</h2>{'<p class=ok-msg>✅ Salvo no Tamino. Confira abaixo se os valores e os exemplos ficaram como você queria.</p>' if 'salvo=1' in self.path else ''}
 <table><tr><th></th><th>Taxa</th><th>Exemplos</th></tr>
 <tr><td>Entrada</td><td><b>{html.escape(fmt_taxa(base.get("in")))}</b></td><td class=meta>{html.escape(exemplos("in"))}</td></tr>
 <tr><td>Saída</td><td><b>{html.escape(fmt_taxa(base.get("out")))}</b></td><td class=meta>{html.escape(exemplos("out"))}</td></tr></table>
 <h3>Exceções</h3>{f"<table><tr><th>Direção</th><th>Taxa</th><th>Provedor</th><th>Vigência</th></tr>{ex}</table>" if ex else "<p class=vazio>Nenhuma.</p>"}
 <h3>Interno (não repassar ao cliente)</h3>
 <p class=meta>Gerente: {html.escape(mgr.get("name") or "—")} · tier {html.escape(str(mgr.get("tierName") or "—"))}<br>
-Piso entrada: {html.escape(fmt_taxa(piso.get("in")))} · Piso saída: {html.escape(fmt_taxa(piso.get("out")))}</p>""", filtro))
+Piso entrada: {html.escape(fmt_taxa(piso.get("in")))} · Piso saída: {html.escape(fmt_taxa(piso.get("out")))}</p>
+{self.taxa_form(tid, d)}""", filtro))
+
+    def taxa_form(self, tid, d):
+        base, mgr, perm = d.get("base") or {}, d.get("manager") or {}, d.get("permissions") or {}
+        piso, mk = mgr.get("floor") or {}, mgr.get("markup") or {}
+        pct = lambda bps: f"{(bps or 0) / 100:.2f}"
+        rs = lambda c: f"{(c or 0) / 100:.2f}"
+        T = f'<input type=hidden name=t value="{TOKEN}"><input type=hidden name=tenant value="{tid}">'
+        dis = lambda k: "" if perm.get(k) else "disabled title='Seu perfil não pode editar isto'"
+        def bloco(direcao, rot):
+            b = base.get(direcao) or {}
+            return f"""<form method=post class="card taxf" data-dir="{direcao}" onsubmit="return confirmarTaxa(this)">{T}
+<input type=hidden name=acao value=taxa_base><input type=hidden name=dir value="{direcao}">
+<input type=hidden name=antes value="{html.escape(fmt_taxa(b))}">
+<h3>{rot}</h3><p>% <input name=pct type=number step=0.01 min=0 max=100 value="{pct(b.get("percentageBps"))}" {dis("editBase")}>
+ + fixo R$ <input name=fixo type=number step=0.01 min=0 value="{rs(b.get("fixedAmountInCents"))}" {dis("editBase")}></p>
+<p class=meta>Atual: {html.escape(fmt_taxa(b))} · piso do gerente: {html.escape(fmt_taxa(piso.get(direcao)))}</p>
+<button {dis("editBase")}>Salvar {rot.lower()}</button></form>"""
+        comissao = f"""<form method=post class="card taxf" onsubmit="return confirmarComissao(this)">{T}
+<input type=hidden name=acao value=taxa_comissao>
+<input type=hidden name=antes value="in {pct(mk.get('inBps'))}% / out {pct(mk.get('outBps'))}%">
+<h3>Comissão do gerente: {html.escape(mgr.get("name") or "—")}</h3>
+<p>Pix recebido % <input name=in_pct type=number step=0.01 min=0 value="{pct(mk.get("inBps"))}" {dis("editManagerCommission")}>
+ · Saque % <input name=out_pct type=number step=0.01 min=0 value="{pct(mk.get("outBps"))}" {dis("editManagerCommission")}></p>
+<p class=meta>Não muda a taxa do cliente. A margem disponível é a taxa do cliente menos o piso.</p>
+<p id=margem class=alerta></p>
+<button {dis("editManagerCommission")}>Salvar comissão</button></form>"""
+        dados = json.dumps({"piso_in": (piso.get("in") or {}).get("percentageBps") or 0, "piso_out": (piso.get("out") or {}).get("percentageBps") or 0})
+        return f"""<h3 id=editar>✏️ Editar tarifas</h3>
+<div class=taxgrid>{bloco("in", "Pix recebido")}{bloco("out", "Saque")}</div>{comissao}
+<script>const PISO={dados};
+function v(f,n){{return parseFloat((f.querySelector('[name='+n+']')||{{}}).value||0)}}
+function margem(){{let fi=document.querySelector('form.taxf[data-dir=in]'),fo=document.querySelector('form.taxf[data-dir=out]'),fc=document.querySelector('form.taxf:not([data-dir])');
+  if(!fi||!fc)return;let mi=v(fi,'pct')-PISO.piso_in/100,mo=v(fo,'pct')-PISO.piso_out/100,ci=v(fc,'in_pct'),co=v(fc,'out_pct'),av=[];
+  if(v(fi,'pct')<PISO.piso_in/100)av.push('Pix recebido abaixo do piso do gerente ('+(PISO.piso_in/100).toFixed(2)+'%).');
+  if(ci>mi+1e-9)av.push('Comissão Pix ('+ci.toFixed(2)+'%) maior que a margem ('+mi.toFixed(2)+'%).');
+  if(co>mo+1e-9)av.push('Comissão saque ('+co.toFixed(2)+'%) maior que a margem ('+mo.toFixed(2)+'%).');
+  document.getElementById('margem').textContent=av.length?'⚠ '+av.join(' '):'✓ Margem Pix: '+mi.toFixed(2)+'% · comissão cabe.'}}
+document.addEventListener('input',e=>{{if(e.target.closest('form.taxf'))margem()}});addEventListener('DOMContentLoaded',margem);
+function confirmarTaxa(f){{margem();let novo=v(f,'pct').toFixed(2)+'%'+(v(f,'fixo')?' + R$ '+v(f,'fixo').toFixed(2):'');
+  return confirm('Alterar '+(f.dataset.dir==='in'?'Pix recebido':'Saque')+' de '+f.antes.value+' para '+novo+'?\\n\\nIsso muda a taxa REAL cobrada do cliente no Tamino.'+(document.getElementById('margem').textContent.startsWith('⚠')?'\\n\\n'+document.getElementById('margem').textContent:''))}}
+function confirmarComissao(f){{margem();return confirm('Alterar comissão do gerente de '+f.antes.value+' para in '+v(f,'in_pct').toFixed(2)+'% / out '+v(f,'out_pct').toFixed(2)+'%?'+(document.getElementById('margem').textContent.startsWith('⚠')?'\\n\\n'+document.getElementById('margem').textContent:''))}}
+</script>"""
 
     def conversa(self, cid, filtro):
         if not RE_CONV.match(cid):
@@ -2678,6 +2724,32 @@ function apagarMsg(id){{if(confirm('Apagar esta mensagem? Ela some para o client
             if RE_CONV.match(cid):
                 salvar_idioma(cid, f.get("lang", ""))
             return self._ir(f"/c/{volta}?f={filtro}" if RE_CONV.match(volta) else f"/?f={filtro}")
+        if acao in ("taxa_base", "taxa_comissao"):
+            tid = f.get("tenant", "")
+            if not RE_CONV.match(tid):
+                return self._html("tenant inválido", 400)
+            bps = lambda k: int(round(float(f.get(k) or 0) * 100))
+            try:
+                atual = tamino_get(f"/admin/fee-pricing/tenants/{tid}") or {}
+                if acao == "taxa_base":
+                    d_ = f.get("dir")
+                    if d_ not in ("in", "out") or not (0 <= bps("pct") <= 10000):
+                        return self._html("valores inválidos", 400)
+                    b = (atual.get("base") or {}).get(d_) or {}
+                    corpo = {"percentageBps": bps("pct"), "fixedAmountInCents": int(round(float(f.get("fixo") or 0) * 100)) or None,
+                             "minAmountInCents": b.get("minAmountInCents"), "maxAmountInCents": b.get("maxAmountInCents")}
+                    tamino_post(f"/admin/fee-pricing/tenants/{tid}/base/{d_}", corpo, metodo="PUT")
+                else:
+                    mk = ((atual.get("manager") or {}).get("markup")) or {}
+                    corpo = {"inBps": bps("in_pct"), "inFixedCents": mk.get("inFixedCents"),
+                             "outBps": bps("out_pct") or None, "outFixedCents": mk.get("outFixedCents")}
+                    tamino_post(f"/admin/fee-pricing/tenants/{tid}/manager-commission", corpo, metodo="PUT")
+                registrar_acao("taxa_alterada", tid)
+                _TAXAS["t"] = 0  # força reler a lista
+            except Exception as e:
+                return self._html(pagina("Taxas", f"<p class=alerta>Não salvou: {html.escape(str(e))}</p><p><a href=/taxas/{tid}>voltar</a></p>"
+                                         "<p class=meta>Nada foi alterado. Se for formato de dados, me mande esta mensagem.</p>", filtro), 502)
+            return self._ir(f"/taxas/{tid}?salvo=1#editar")
         if acao == "reenviar_convite":
             iid = f.get("convite", "")
             if not RE_CONV.match(iid):
