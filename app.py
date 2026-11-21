@@ -2339,20 +2339,26 @@ No iPhone pelo controle remoto, o Safari não permite notificação fora da pág
                     sel = qv["tenant"][0]  # trocou o tenant no select
                 ops = "".join(f'<option value="{html.escape(x["tenantId"])}" {"selected" if x["tenantId"] == sel else ""}>{html.escape(x["tenantName"])}</option>'
                               for x in sorted(lista, key=lambda x: x["tenantName"].lower()))
-                atual, piso_in, com = "", 0, 0
+                atual, piso_in, com, piso_out, com_out, gerente = "", 0, 0, 0, 0, "—"
                 nome_sel = next((x["tenantName"] for x in lista if x["tenantId"] == sel), "")
                 if sel:
                     det = tamino_get(f"/admin/fee-pricing/tenants/{sel}") or {}
                     b, m = det.get("base") or {}, det.get("manager") or {}
                     atual = f'Atual: Pix in {fmt_taxa(b.get("in"))} · saque {fmt_taxa(b.get("out"))} · gerente {m.get("name") or "—"}'
                     piso_in = (((m.get("floor") or {}).get("in")) or {}).get("percentageBps") or 0
+                    piso_out = (((m.get("floor") or {}).get("out")) or {}).get("percentageBps") or 0
+                    com_out = ((m.get("markup") or {}).get("outBps")) or 0
+                    gerente = m.get("name") or "—"
                     com = ((m.get("markup") or {}).get("inBps")) or 0
                 aviso = "" if sel else "<p class=alerta>Não achei o tenant pelo nome do grupo: escolha na lista.</p>"
                 corpo = (f'<div class=card>{aviso}<p>Tenant <select id=tenant_taxa onchange="abrirTaxaTenant(this.value)">{ops if sel else "<option value=\"\">escolha…</option>" + ops}</select></p>'
                          f'<p class=meta>{html.escape(atual)}</p>'
                          f'<p>Nova taxa (entrada/saída em %): <input id=nova_taxa placeholder="3.7/1" oninput="previaTaxa()" style="width:110px"> '
                          f'<button type=button onclick="salvarTaxaConversa()">Salvar no Tamino</button></p>'
-                         f'<p id=prev_taxa class=meta data-pisoin="{piso_in / 100}" data-com="{com / 100}" data-min="{min_total(nome_sel) or 0}"></p></div>'
+                         f'<p id=prev_taxa class=meta data-pisoin="{piso_in / 100}" data-pisoout="{piso_out / 100}" data-com="{com / 100}" data-comout="{com_out / 100}" data-min="{min_total(nome_sel) or 0}"></p>'
+                         f'<p>Comissão do gerente {html.escape(gerente)}: Pix in <input id=com_in type=number step=0.01 min=0 style="width:80px" oninput="this.dataset.manual=1;previaTaxa()"> % '
+                         f'· saque <input id=com_out type=number step=0.01 min=0 style="width:80px" oninput="this.dataset.manual=1;previaTaxa()"> % '
+                         f'<span class=meta>(atual {com / 100:.2f}% / {com_out / 100:.2f}%; {"mantida: tenant com regra do superior, ajuste à mão se precisar" if min_total(nome_sel) else "entrada calculada = taxa do cliente − piso"})</span></p></div>'
                          '<script>function abrirTaxaTenant(t){let b=document.querySelector("button[onclick^=abrirTaxa]");'
                          'fetch("/taxa-da-conversa?tenant="+t).then(r=>r.text()).then(h=>{document.getElementById("convbox").innerHTML=h})}</script>')
             except Exception as e:
@@ -2712,16 +2718,22 @@ fetch('/taxa-da-conversa?conv={cid}&nome='+encodeURIComponent({json.dumps(nome)}
 function previaTaxa(){{let v=(document.getElementById('nova_taxa').value||'').replace(/,/g,'.').split('/').map(x=>parseFloat(x));
   let ok=v.length===2&&v.every(x=>!isNaN(x)&&x>=0),pv=document.getElementById('prev_taxa'),pin=+pv.dataset.pisoin,com=+pv.dataset.com;
   if(!ok){{pv.textContent='Formato: entrada/saída em %, ex.: 3.7/1';return null}}
+  let ci=document.getElementById('com_in'),co=document.getElementById('com_out'),pout=+pv.dataset.pisoout||0;
+  let mtx=+pv.dataset.min||0;
+  /* comissão de entrada acompanha a taxa (cliente − piso); saque mantém. Tenant com regra do superior: não mexe sozinho */
+  if(ci&&!ci.dataset.manual)ci.value=(mtx?+pv.dataset.com:Math.max(0,v[0]-pin)).toFixed(2);
+  if(co&&!co.dataset.manual)co.value=(+pv.dataset.comout).toFixed(2);
+  let txtCom=ci?' · comissão: in '+(+pv.dataset.com).toFixed(2)+'% → '+(+ci.value).toFixed(2)+'%, saque '+(+pv.dataset.comout).toFixed(2)+'% → '+(+co.value).toFixed(2)+'%':'';
   let mt=+pv.dataset.min||0;if(mt&&v[0]+v[1]<mt-1e-9){{pv.textContent='⛔ Regra do superior: mínimo de '+mt.toFixed(2)+'% no total (entrada + saída). Agora: '+(v[0]+v[1]).toFixed(2)+'%.';return null}}
-  if(mt){{pv.textContent='Novo: Pix in '+v[0].toFixed(2)+'% · saque '+v[1].toFixed(2)+'% = '+(v[0]+v[1]).toFixed(2)+'% total  ✓ dentro da regra do superior (mín. '+mt.toFixed(2)+'%)';return v}}
-  let av=[];if(v[0]<pin)av.push('entrada abaixo do piso ('+pin.toFixed(2)+'%)');if(com>v[0]-pin+1e-9)av.push('comissão do gerente ('+com.toFixed(2)+'%) passa da margem ('+(v[0]-pin).toFixed(2)+'%): ajuste em Taxas');
-  pv.textContent='Novo: Pix in '+v[0].toFixed(2)+'% · saque '+v[1].toFixed(2)+'%'+(av.length?'  ⚠ '+av.join('; '):'  ✓ dentro do piso e da margem');return v}}
+  if(mt){{pv.textContent='Novo: Pix in '+v[0].toFixed(2)+'% · saque '+v[1].toFixed(2)+'% = '+(v[0]+v[1]).toFixed(2)+'% total  ✓ dentro da regra do superior (mín. '+mt.toFixed(2)+'%)'+txtCom;return v}}
+  let av=[];if(v[0]<pin)av.push('entrada abaixo do piso ('+pin.toFixed(2)+'%)');if(ci&&+ci.value>v[0]-pin+1e-9)av.push('comissão passa da margem ('+Math.max(0,v[0]-pin).toFixed(2)+'%)');
+  pv.textContent='Novo: Pix in '+v[0].toFixed(2)+'% · saque '+v[1].toFixed(2)+'%'+txtCom+(av.length?'  ⚠ '+av.join('; '):'  ✓ dentro do piso e da margem');return v}}
 function salvarTaxaConversa(){{let v=previaTaxa();if(!v)return;let tid=document.getElementById('tenant_taxa').value,tn=document.getElementById('tenant_taxa').selectedOptions[0].text;
   if(!confirm('Alterar a taxa REAL do tenant '+tn+' para Pix in '+v[0].toFixed(2)+'% e saque '+v[1].toFixed(2)+'%?\\n\\n'+document.getElementById('prev_taxa').textContent))return;
-  fetch('/',{{method:'POST',headers:{{'content-type':'application/x-www-form-urlencoded'}},body:'t={TOKEN}&acao=taxa_rapida&tenant='+tid+'&in_pct='+v[0]+'&out_pct='+v[1]+'&lang={idioma(cid, hist)}'}})
+  fetch('/',{{method:'POST',headers:{{'content-type':'application/x-www-form-urlencoded'}},body:'t={TOKEN}&acao=taxa_rapida&tenant='+tid+'&in_pct='+v[0]+'&out_pct='+v[1]+'&com_in='+document.getElementById('com_in').value+'&com_out='+document.getElementById('com_out').value+'&lang={idioma(cid, hist)}'}})
   .then(r=>r.json()).then(d=>{{let box=document.getElementById('convbox');
     if(d.erro){{box.insertAdjacentHTML('beforeend','<p class=alerta>Não salvou: '+d.erro+'</p>');return}}
-    box.insertAdjacentHTML('beforeend','<p class=ok-msg>✅ Salvo. Agora: Pix in '+d.in_+' · saque '+d.out+'</p>');document.getElementById('txc').value=d.msg}})}}
+    box.insertAdjacentHTML('beforeend','<p class=ok-msg>✅ Salvo. Agora: Pix in '+d.in_+' · saque '+d.out+' · comissão do gerente: in '+d.com_in+' · saque '+d.com_out+'</p>');document.getElementById('txc').value=d.msg}})}}
 function conviteDaConversa(b){{b.disabled=true;b.textContent='✉️ procurando…';
 fetch('/convite-da-conversa?conv={cid}').then(r=>r.json()).then(d=>{{b.disabled=false;b.textContent='✉️ Reenviar convite';
   let box=document.getElementById('convbox');
@@ -2836,21 +2848,36 @@ function apagarMsg(id){{if(confirm('Apagar esta mensagem? Ela some para o client
                     raise ValueError("valores fora de 0 a 100%")
                 atual = tamino_get(f"/admin/fee-pricing/tenants/{tid}") or {}
                 checar_min_total(tid, atual.get("tenantName") or "", novo["in"], novo["out"])
+                mk = ((atual.get("manager") or {}).get("markup")) or {}
+                com = {"in": float(f.get("com_in") or 0), "out": float(f.get("com_out") or 0)}
+                if not all(0 <= v <= 100 for v in com.values()):
+                    raise ValueError("comissão fora de 0 a 100%")
+                corpo_com = {"inBps": int(round(com["in"] * 100)), "inFixedCents": mk.get("inFixedCents"),
+                             "outBps": int(round(com["out"] * 100)) or None, "outFixedCents": mk.get("outFixedCents")}
+                mudou_com = corpo_com["inBps"] != (mk.get("inBps") or 0) or (corpo_com["outBps"] or 0) != (mk.get("outBps") or 0)
+                base_atual = (atual.get("base") or {}).get("in", {}).get("percentageBps") or 0
+                baixando = int(round(novo["in"] * 100)) < base_atual
+                if mudou_com and baixando:  # baixa a comissão antes, senão a taxa nova não cabe
+                    tamino_post(f"/admin/fee-pricing/tenants/{tid}/manager-commission", corpo_com, metodo="PUT")
                 for d_, v in novo.items():
                     b = (atual.get("base") or {}).get(d_) or {}
                     tamino_post(f"/admin/fee-pricing/tenants/{tid}/base/{d_}", {
                         "percentageBps": int(round(v * 100)), "fixedAmountInCents": b.get("fixedAmountInCents"),
                         "minAmountInCents": b.get("minAmountInCents"), "maxAmountInCents": b.get("maxAmountInCents")}, metodo="PUT")
+                if mudou_com and not baixando:
+                    tamino_post(f"/admin/fee-pricing/tenants/{tid}/manager-commission", corpo_com, metodo="PUT")
                 registrar_acao("taxa_alterada", tid)
                 _TAXAS["t"] = 0
-                depois = (tamino_get(f"/admin/fee-pricing/tenants/{tid}") or {}).get("base") or {}
+                dep = tamino_get(f"/admin/fee-pricing/tenants/{tid}") or {}
+                depois, mk2 = dep.get("base") or {}, ((dep.get("manager") or {}).get("markup")) or {}
                 fi, fo = fmt_taxa(depois.get("in")), fmt_taxa(depois.get("out"))
                 lang = f.get("lang", "pt")
                 msg = {"pt": f"Prontinho! A taxa de vocês já foi ajustada para {fi} no Pix in e {fo} no saque.",
                        "en": f"Done! Your rate has been adjusted to {fi} on Pix in and {fo} on payouts.",
                        "es": f"¡Listo! Su tasa ya fue ajustada a {fi} en Pix in y {fo} en retiros.",
                        "zh": f"已完成！您的费率已调整为 Pix 收款 {fi}，提现 {fo}。"}.get(lang, "")
-                corpo = {"in_": fi, "out": fo, "msg": msg.replace(",00%", "%")}
+                corpo = {"in_": fi, "out": fo, "msg": msg.replace(",00%", "%"),
+                         "com_in": f'{(mk2.get("inBps") or 0) / 100:.2f}%', "com_out": f'{(mk2.get("outBps") or 0) / 100:.2f}%'}
             except Exception as e:
                 corpo = {"erro": str(e)}
             dados = json.dumps(corpo, ensure_ascii=False).encode()
