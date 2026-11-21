@@ -1461,6 +1461,30 @@ def _alnum(t):
     return re.sub(r"[^a-z0-9]", "", t)
 
 
+REGRA_MIN_PADRAO = "cepay = 3.4"
+
+
+def min_total(nome_tenant):
+    """Mínimo de entrada% + saída% definido pelo superior (🔧 → Regras de taxa). None se não houver regra."""
+    alvo = _alnum(nome_tenant)
+    for linha in cfg("taxa_min_total", REGRA_MIN_PADRAO).splitlines():
+        if "=" in linha:
+            n, v = linha.split("=", 1)
+            try:
+                if _alnum(n) and _alnum(n) == alvo:
+                    return float(v.strip().replace(",", "."))
+            except ValueError:
+                pass
+    return None
+
+
+def checar_min_total(tid, nome, novo_in, novo_out):
+    mt = min_total(nome)
+    if mt is not None and novo_in + novo_out < mt - 1e-9:
+        raise ValueError(f"Regra do superior: {nome.strip()} não pode ficar abaixo de {mt:.2f}% no total "
+                         f"(entrada + saída). Você pôs {novo_in:.2f}% + {novo_out:.2f}% = {novo_in + novo_out:.2f}%. Nada foi alterado.")
+
+
 def vazao_html(d):
     """Volume real processado hoje (não é a capacidade máxima: limites/provedores são 403 p/ suporte)."""
     cs, ps = d.get("chargeStats") or {}, d.get("payoutStats") or {}
@@ -2158,6 +2182,12 @@ No iPhone pelo controle remoto, o Safari não permite notificação fora da pág
 <p class=meta>Use <code>{{nome}}</code> e <code>{{hora}}</code> para preencher sozinho. Ao clicar em ▶ Entrar / ⏹ Sair (canto superior direito) o painel pergunta se envia no grupo do N2.</p>
 <button name=acao value=config_ponto>Salvar</button></form></div>
 
+<div class=card><h3>🔒 Regras de taxa (mínimo total)</h3><form method=post>{T}
+<textarea name=taxa_min_total rows=3 spellcheck=false>{html.escape(cfg("taxa_min_total", REGRA_MIN_PADRAO))}</textarea>
+<p class=meta>Uma linha por tenant: <code>nome = mínimo%</code>. O painel bloqueia salvar quando entrada + saída ficar abaixo do mínimo
+(ex.: cepay 3/0.3 = 3,3% é bloqueado; 3/1 = 4% passa).</p>
+<button name=acao value=config_regras>Salvar</button></form></div>
+
 <div class=card><h3>🕗 Horário de trabalho</h3><form method=post>{T}
 <p>Das <input type=time name=turno_inicio value="{cfg("turno_inicio", "20:00")}"> às <input type=time name=turno_fim value="{cfg("turno_fim", "04:00")}"></p>
 <p class=meta>Os Insights contam por turno: o turno de 19/11 vai das 20:00 de 19/11 às 04:00 de 20/11. O que acontece fora do expediente não entra.</p>
@@ -2206,6 +2236,8 @@ No iPhone pelo controle remoto, o Safari não permite notificação fora da pág
                 cfg_salvar(msg_entrada=f["msg_entrada"].strip()[:500])
             if f.get("msg_saida", "").strip():
                 cfg_salvar(msg_saida=f["msg_saida"].strip()[:500])
+        elif a == "config_regras":
+            cfg_salvar(taxa_min_total=f.get("taxa_min_total", "").strip()[:2000])
         elif a == "config_turno":
             ok = lambda v: bool(re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", v or ""))
             if ok(f.get("turno_inicio")) and ok(f.get("turno_fim")):
@@ -2308,6 +2340,7 @@ No iPhone pelo controle remoto, o Safari não permite notificação fora da pág
                 ops = "".join(f'<option value="{html.escape(x["tenantId"])}" {"selected" if x["tenantId"] == sel else ""}>{html.escape(x["tenantName"])}</option>'
                               for x in sorted(lista, key=lambda x: x["tenantName"].lower()))
                 atual, piso_in, com = "", 0, 0
+                nome_sel = next((x["tenantName"] for x in lista if x["tenantId"] == sel), "")
                 if sel:
                     det = tamino_get(f"/admin/fee-pricing/tenants/{sel}") or {}
                     b, m = det.get("base") or {}, det.get("manager") or {}
@@ -2319,7 +2352,7 @@ No iPhone pelo controle remoto, o Safari não permite notificação fora da pág
                          f'<p class=meta>{html.escape(atual)}</p>'
                          f'<p>Nova taxa (entrada/saída em %): <input id=nova_taxa placeholder="3.7/1" oninput="previaTaxa()" style="width:110px"> '
                          f'<button type=button onclick="salvarTaxaConversa()">Salvar no Tamino</button></p>'
-                         f'<p id=prev_taxa class=meta data-pisoin="{piso_in / 100}" data-com="{com / 100}"></p></div>'
+                         f'<p id=prev_taxa class=meta data-pisoin="{piso_in / 100}" data-com="{com / 100}" data-min="{min_total(nome_sel) or 0}"></p></div>'
                          '<script>function abrirTaxaTenant(t){let b=document.querySelector("button[onclick^=abrirTaxa]");'
                          'fetch("/taxa-da-conversa?tenant="+t).then(r=>r.text()).then(h=>{document.getElementById("convbox").innerHTML=h})}</script>')
             except Exception as e:
@@ -2679,6 +2712,8 @@ fetch('/taxa-da-conversa?conv={cid}&nome='+encodeURIComponent({json.dumps(nome)}
 function previaTaxa(){{let v=(document.getElementById('nova_taxa').value||'').replace(/,/g,'.').split('/').map(x=>parseFloat(x));
   let ok=v.length===2&&v.every(x=>!isNaN(x)&&x>=0),pv=document.getElementById('prev_taxa'),pin=+pv.dataset.pisoin,com=+pv.dataset.com;
   if(!ok){{pv.textContent='Formato: entrada/saída em %, ex.: 3.7/1';return null}}
+  let mt=+pv.dataset.min||0;if(mt&&v[0]+v[1]<mt-1e-9){{pv.textContent='⛔ Regra do superior: mínimo de '+mt.toFixed(2)+'% no total (entrada + saída). Agora: '+(v[0]+v[1]).toFixed(2)+'%.';return null}}
+  if(mt){{pv.textContent='Novo: Pix in '+v[0].toFixed(2)+'% · saque '+v[1].toFixed(2)+'% = '+(v[0]+v[1]).toFixed(2)+'% total  ✓ dentro da regra do superior (mín. '+mt.toFixed(2)+'%)';return v}}
   let av=[];if(v[0]<pin)av.push('entrada abaixo do piso ('+pin.toFixed(2)+'%)');if(com>v[0]-pin+1e-9)av.push('comissão do gerente ('+com.toFixed(2)+'%) passa da margem ('+(v[0]-pin).toFixed(2)+'%): ajuste em Taxas');
   pv.textContent='Novo: Pix in '+v[0].toFixed(2)+'% · saque '+v[1].toFixed(2)+'%'+(av.length?'  ⚠ '+av.join('; '):'  ✓ dentro do piso e da margem');return v}}
 function salvarTaxaConversa(){{let v=previaTaxa();if(!v)return;let tid=document.getElementById('tenant_taxa').value,tn=document.getElementById('tenant_taxa').selectedOptions[0].text;
@@ -2800,6 +2835,7 @@ function apagarMsg(id){{if(confirm('Apagar esta mensagem? Ela some para o client
                 if not all(0 <= v <= 100 for v in novo.values()):
                     raise ValueError("valores fora de 0 a 100%")
                 atual = tamino_get(f"/admin/fee-pricing/tenants/{tid}") or {}
+                checar_min_total(tid, atual.get("tenantName") or "", novo["in"], novo["out"])
                 for d_, v in novo.items():
                     b = (atual.get("base") or {}).get(d_) or {}
                     tamino_post(f"/admin/fee-pricing/tenants/{tid}/base/{d_}", {
@@ -2835,6 +2871,9 @@ function apagarMsg(id){{if(confirm('Apagar esta mensagem? Ela some para o client
                     if d_ not in ("in", "out") or not (0 <= bps("pct") <= 10000):
                         return self._html("valores inválidos", 400)
                     b = (atual.get("base") or {}).get(d_) or {}
+                    outra = ((atual.get("base") or {}).get("out" if d_ == "in" else "in") or {}).get("percentageBps") or 0
+                    ni, no = (bps("pct"), outra) if d_ == "in" else (outra, bps("pct"))
+                    checar_min_total(tid, atual.get("tenantName") or "", ni / 100, no / 100)
                     corpo = {"percentageBps": bps("pct"), "fixedAmountInCents": int(round(float(f.get("fixo") or 0) * 100)) or None,
                              "minAmountInCents": b.get("minAmountInCents"), "maxAmountInCents": b.get("maxAmountInCents")}
                     tamino_post(f"/admin/fee-pricing/tenants/{tid}/base/{d_}", corpo, metodo="PUT")
@@ -3026,6 +3065,13 @@ abd4161e-c248-48bb-a38c-1fdad3fd7e4b
     assert dia_turno(ts(19, 20)) == date(2026, 11, 19) and dia_turno(ts(20, 3, 59)) == date(2026, 11, 19)
     assert dia_turno(ts(20, 4)) is None and dia_turno(ts(20, 15)) is None and dia_turno(ts(20, 23)) == date(2026, 11, 20)
     assert "{" not in msg_ponto("entrada")
+    assert min_total("cepay") == 3.4 and min_total("outro") is None
+    try:
+        checar_min_total("x", "cepay", 3.0, 0.3)
+        assert False, "deveria bloquear"
+    except ValueError:
+        pass
+    checar_min_total("x", "cepay", 3.0, 1.0)
     assert fmt_taxa({"percentageBps": 460}) == "4,60%"
     assert fmt_taxa({"percentageBps": 500, "fixedAmountInCents": 200, "minAmountInCents": 50}) == "5,00% + R$ 2,00 (mín R$ 0,50)"
     assert fmt_taxa({"percentageBps": 0, "fixedAmountInCents": 0}) == "0"
