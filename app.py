@@ -675,7 +675,22 @@ def _redigir_api(modelo, pedido, sistema=None, limpar=True):
 
 
 # ---------- vigia ----------
-VIGIA_INTERVALO_S = 15
+VIGIA_INTERVALO_S = 5
+_POOL = None
+
+
+def em_segundo_plano(fn, *a):
+    """Rascunhos com IA e histórico de insights rodam fora do loop do vigia (senão atrasam as conversas)."""
+    global _POOL
+    if _POOL is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _POOL = ThreadPoolExecutor(3, thread_name_prefix="tarefa")
+    def seguro():
+        try:
+            fn(*a)
+        except Exception as e:
+            print(f"[tarefa] {getattr(fn, '__name__', fn)}: {e}", flush=True)
+    _POOL.submit(seguro)
 FEED = []  # última foto das conversas, para o painel
 
 
@@ -905,7 +920,7 @@ def vigia():
                 marcar("Evo", False, str(e))
                 raise
             atualizar_feed(conversas)
-            coletar_insights(conversas)
+            em_segundo_plano(coletar_insights, conversas)
             ign = ignorados()
             for conv, msg_id, nome, quando in novas_mensagens(conversas, vistos):
                 if conv in ign:
@@ -921,10 +936,7 @@ def vigia():
                 if eh_n2(nome):
                     print(f"[vigia] {nome}: mensagem do N2 (sem automação)", flush=True)
                 elif quando >= corte:
-                    try:
-                        tratar(conv, nome)
-                    except Exception as e:
-                        print(f"[vigia] {nome}: erro {e}", flush=True)
+                    em_segundo_plano(tratar, conv, nome)
                 vistos.add(msg_id)
                 with db() as c:
                     c.execute("insert or ignore into vistos values(?)", (msg_id,))
@@ -1104,12 +1116,15 @@ function checar(){{fetch('/novidades?desde='+desde).then(r=>r.json()).then(d=>{{
   if(!desde){{desde=d.agora;sessionStorage.setItem('desde',desde);return}}
   desde=d.agora;sessionStorage.setItem('desde',desde);
   if(!d.eventos.length)return;
+  /* mensagem nova: recarrega a conversa aberta (se for dela) ou a fila, sem atrapalhar quem está digitando */
+  if(!sujo&&!document.activeElement.matches('textarea')&&(location.pathname==='/'||d.eventos.some(e=>location.pathname==='/c/'+e.conv)))
+    setTimeout(()=>location.reload(),300);
   naoLidas+=d.eventos.length;sessionStorage.setItem('naoLidas',naoLidas);marcaTitulo();bip();
   if(window.Notification&&Notification.permission==='granted')d.eventos.slice(-3).forEach(e=>{{
     let n=new Notification(e.nome,{{body:e.texto,icon:'/static/logo-256.png?v=2',tag:e.conv}});n.onclick=()=>{{focus();location='/c/'+e.conv}}}});
 }}).catch(()=>{{}})}}
 addEventListener('focus',()=>{{naoLidas=0;sessionStorage.setItem('naoLidas',0);marcaTitulo()}});
-addEventListener('DOMContentLoaded',()=>{{marcaTitulo();checar();setInterval(checar,8000)}});
+addEventListener('DOMContentLoaded',()=>{{marcaTitulo();checar();setInterval(checar,3000)}});
 /* tempo ativo: conta 1 minuto se a página está visível e houve interação nos últimos 3 min */
 let ultInteracao=Date.now();['mousemove','keydown','touchstart','click','scroll'].forEach(e=>addEventListener(e,()=>ultInteracao=Date.now(),{{passive:true}}));
 setInterval(()=>{{if(document.visibilityState==='visible'&&Date.now()-ultInteracao<180000)fetch('/ping',{{method:'POST'}}).catch(()=>{{}})}},60000);
@@ -1155,7 +1170,7 @@ addEventListener('DOMContentLoaded',()=>{{
 </script>
 <script>/* recarrega a cada 10s (só fila/conversas), menos enquanto você edita um texto */
 let sujo=false;addEventListener('input',()=>sujo=true);
-if({'true' if recarregar else 'false'})setInterval(()=>{{if(!sujo&&!document.activeElement.matches('textarea'))location.reload()}},10000)</script>
+if({'true' if recarregar else 'false'})setInterval(()=>{{if(!sujo&&!document.activeElement.matches('textarea'))location.reload()}},20000)</script>
 <style>{CSS}</style><a class=fab href="/config?f={html.escape(filtro)}" title="Configurações">🔧</a><div class=marca><img src="/static/logo-256.png?v=2" alt=""><span>Atendimento <b>Tamino</b></span>{ponto_html()}</div>{status_html()}{abas(titulo, filtro)}
 <div class=grid><div>{principal}</div>
 <div class=feed><b>Conversas</b>
@@ -1543,6 +1558,64 @@ def webhook_tabela(w):
     return (f'<div class=meta>Webhooks {titulo}: últimas {w["n"]} entregas ({w["de"]} → {w["ate"]})</div>'
             + tabela(["Média", "Mediana", "90% até", "Máximo", "1ª tentativa"],
                      [[ms(w["media"]), ms(w["mediana"]), ms(w["p90"]), ms(w["max"]), f'{w["primeira"]:.0f}%']]))
+
+
+# ---------- consulta de IDs da conversa -> mensagem de status ----------
+FRASES_STATUS = {
+    "pt": {"pago": "foi pago", "falhou": "não foi processado, nenhum valor foi enviado", "proc": "está em processamento",
+           "expirou": "expirou sem pagamento", "cancelado": "foi cancelado", "estornado": "foi estornado",
+           "nao": "Não localizei o ID {id} aqui, confere pra mim?", "saque": "O saque", "cob": "A cobrança", "id": "O ID",
+           "de": "de", "intro": "Verifiquei aqui:"},
+    "en": {"pago": "was paid", "falhou": "was not processed, no amount was sent", "proc": "is being processed",
+           "expirou": "expired without payment", "cancelado": "was cancelled", "estornado": "was refunded",
+           "nao": "I couldn't find the ID {id} here, could you double check it?", "saque": "The payout", "cob": "The charge", "id": "The ID",
+           "de": "of", "intro": "I checked here:"},
+    "es": {"pago": "fue pagado", "falhou": "no fue procesado, no se envió ningún valor", "proc": "está en procesamiento",
+           "expirou": "expiró sin pago", "cancelado": "fue cancelado", "estornado": "fue reembolsado",
+           "nao": "No encontré el ID {id} aquí, ¿me lo confirmas?", "saque": "El retiro", "cob": "El cobro", "id": "El ID",
+           "de": "de", "intro": "Verifiqué aquí:"},
+    "zh": {"pago": "已支付", "falhou": "未处理，没有发送任何金额", "proc": "正在处理中", "expirou": "已过期未支付",
+           "cancelado": "已取消", "estornado": "已退款", "nao": "这里没有找到ID {id}，麻烦再确认一下？", "saque": "提现",
+           "cob": "收款", "id": "ID", "de": "金额", "intro": "我这边查了一下："},
+}
+GRUPO_STATUS = {"paid": "pago", "completed": "pago", "succeeded": "pago", "failed": "falhou", "expired": "expirou",
+                "cancelled": "cancelado", "canceled": "cancelado", "refunded": "estornado"}
+
+
+def status_dos_ids(ids, lang="pt"):
+    """Consulta cada ID e devolve (texto p/ cliente, linhas internas p/ você)."""
+    fr = FRASES_STATUS.get(lang, FRASES_STATUS["pt"])
+    frases, internas = [], []
+    for i in ids[:30]:
+        try:
+            hits = [h for h in (tamino_lookup(i) or {}).get("hits", []) if h.get("kind") != "webhook_delivery"]
+        except Exception as e:
+            internas.append([html.escape(i[:13]), "erro", html.escape(str(e)[:80]), "", "", ""])
+            continue
+        curto = i[:8]
+        if not hits:
+            frases.append(fr["nao"].format(id=curto))
+            internas.append([html.escape(curto), "—", "não localizado", "", "", ""])
+            continue
+        h = hits[0]
+        st = h.get("status") or ""
+        grupo = GRUPO_STATUS.get(st, "proc")
+        eh_saque = h.get("kind") == "payout"
+        quem = fr["saque"] if eh_saque else fr["cob"]
+        frase_st = fr[grupo]
+        if lang == "pt" and not eh_saque:  # "a cobrança" é feminino
+            frase_st = {"pago": "foi paga", "falhou": "não foi processada, nenhum valor foi recebido", "proc": "está em processamento",
+                        "expirou": "expirou sem pagamento", "cancelado": "foi cancelada", "estornado": "foi estornada"}[grupo]
+        valor = brl(h["amountInCents"]) if h.get("amountInCents") is not None else ""
+        if lang == "zh":
+            frases.append(f"{quem} {curto}{(' ' + fr['de'] + ' ' + valor) if valor else ''} {frase_st}。")
+        else:
+            frases.append(f"{quem} {curto}{(' ' + fr['de'] + ' ' + valor) if valor else ''} {frase_st}.")
+        idf = h.get("identifiers") or {}
+        internas.append([html.escape(curto), html.escape(KIND_PT.get(h.get("kind"), h.get("kind") or "")), badge_status(st),
+                         valor, html.escape(h.get("tenantName") or ""), html.escape((idf.get("failureReason") or "")[:120])])
+    texto = (fr["intro"] + "\n" if len(frases) > 1 else "") + "\n".join(frases)
+    return texto, internas
 
 
 def botao_corrigir(alvo):
@@ -2189,6 +2262,27 @@ No iPhone pelo controle remoto, o Safari não permite notificação fora da pág
             return self.insights({k: v[0] for k, v in urllib.parse.parse_qs(url.query).items()}, filtro)
         if url.path == "/insights/exportar":
             return self.exportar({k: v[0] for k, v in urllib.parse.parse_qs(url.query).items()})
+        if url.path == "/consultar-ids":
+            cid = urllib.parse.parse_qs(url.query).get("conv", [""])[0]
+            try:
+                hist = evo_historico(cid) if RE_CONV.match(cid) else []
+                ids = extrair_ids("\n".join(m["texto"] for m in hist if m["tipo"] == "incoming"))
+                if not ids:
+                    corpo = {"texto": "", "tabela": "<p class=meta>Nenhum ID nas mensagens recentes do cliente.</p>"}
+                else:
+                    texto, internas = status_dos_ids(ids, idioma(cid, hist))
+                    tenants = sorted({l[4] for l in internas if l[4]})
+                    aviso = (f'<p class=alerta>⚠ IDs de mais de um tenant: {", ".join(tenants)}. Confira antes de enviar.</p>'
+                             if len(tenants) > 1 else (f'<p class=meta>Tenant: {tenants[0]} (só para você; não vai na mensagem)</p>' if tenants else ""))
+                    corpo = {"texto": texto, "tabela": aviso + tabela(["ID", "Tipo", "Status", "Valor", "Tenant", "Motivo (interno)"], internas)}
+            except Exception as e:
+                corpo = {"erro": str(e)}
+            dados = json.dumps(corpo, ensure_ascii=False).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(dados)
+            return
         if url.path == "/convite-da-conversa":
             cid = urllib.parse.parse_qs(url.query).get("conv", [""])[0]
             try:
@@ -2466,6 +2560,12 @@ fetch('/webhook-media?conv={cid}&nome='+encodeURIComponent({json.dumps(nome)})).
   if(d.erro){{document.getElementById('convbox').textContent='Falhou: '+d.erro;return}}
   document.getElementById('convbox').innerHTML=d.tabela;if(d.texto)document.getElementById('txc').value=d.texto}})
 .catch(()=>{{b.disabled=false;b.textContent='📨 Média webhook'}})}}
+function consultarIds(b){{b.disabled=true;b.textContent='🔎 consultando…';sujo=true;
+fetch('/consultar-ids?conv={cid}').then(r=>r.json()).then(d=>{{b.disabled=false;b.textContent='🔎 Consultar IDs';
+  let box=document.getElementById('convbox');
+  if(d.erro){{box.textContent='Falhou: '+d.erro;return}}
+  box.innerHTML=d.tabela;if(d.texto)document.getElementById('txc').value=d.texto}})
+.catch(()=>{{b.disabled=false;b.textContent='🔎 Consultar IDs'}})}}
 function conviteDaConversa(b){{b.disabled=true;b.textContent='✉️ procurando…';
 fetch('/convite-da-conversa?conv={cid}').then(r=>r.json()).then(d=>{{b.disabled=false;b.textContent='✉️ Reenviar convite';
   let box=document.getElementById('convbox');
@@ -2490,7 +2590,8 @@ function apagarMsg(id){{if(confirm('Apagar esta mensagem? Ela some para o client
   <div id=rplv class=cit style="display:none">↩︎ Respondendo: <span></span> <button type=button class=sec onclick="semResposta()">✕</button></div>
   <div class=corr><button type=button class=sec onclick="verConversao(this)">📊 Conversão</button>
   <button type=button class=sec onclick="verWebhook(this)">📨 Média webhook</button>
-  <button type=button class=sec onclick="conviteDaConversa(this)">✉️ Reenviar convite</button></div><div id=convbox></div>
+  <button type=button class=sec onclick="conviteDaConversa(this)">✉️ Reenviar convite</button>
+  <button type=button onclick="consultarIds(this)">🔎 Consultar IDs</button></div><div id=convbox></div>
   <textarea name=texto id=txc rows=4 spellcheck=true lang=pt-BR placeholder="Escreva a mensagem…"></textarea>{botao_corrigir("txc")}
   <label class=anexar>📎 Anexar <input type=file name=arquivo multiple onchange="document.getElementById('anx').textContent=[...this.files].map(f=>f.name).join(', ');sujo=true"></label>
   <span id=anx class=meta></span>
