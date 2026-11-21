@@ -2353,12 +2353,12 @@ No iPhone pelo controle remoto, o Safari não permite notificação fora da pág
                 aviso = "" if sel else "<p class=alerta>Não achei o tenant pelo nome do grupo: escolha na lista.</p>"
                 corpo = (f'<div class=card>{aviso}<p>Tenant <select id=tenant_taxa onchange="abrirTaxaTenant(this.value)">{ops if sel else "<option value=\"\">escolha…</option>" + ops}</select></p>'
                          f'<p class=meta>{html.escape(atual)}</p>'
-                         f'<p>Nova taxa (entrada/saída em %): <input id=nova_taxa placeholder="3.7/1" oninput="previaTaxa()" style="width:110px"> '
+                         f'<p>Nova taxa (entrada/saída em %): <input id=nova_taxa placeholder="3.7/1" oninput="let c=document.getElementById(\'com_in\');if(c)delete c.dataset.manual;previaTaxa()" style="width:110px"> '
                          f'<button type=button onclick="salvarTaxaConversa()">Salvar no Tamino</button></p>'
                          f'<p id=prev_taxa class=meta data-pisoin="{piso_in / 100}" data-pisoout="{piso_out / 100}" data-com="{com / 100}" data-comout="{com_out / 100}" data-min="{min_total(nome_sel) or 0}"></p>'
                          f'<p>Comissão do gerente {html.escape(gerente)}: Pix in <input id=com_in type=number step=0.01 min=0 style="width:80px" oninput="this.dataset.manual=1;previaTaxa()"> % '
                          f'· saque <input id=com_out type=number step=0.01 min=0 style="width:80px" oninput="this.dataset.manual=1;previaTaxa()"> % '
-                         f'<span class=meta>(atual {com / 100:.2f}% / {com_out / 100:.2f}%; {"mantida: tenant com regra do superior, ajuste à mão se precisar" if min_total(nome_sel) else "entrada calculada = taxa do cliente − piso"})</span></p></div>'
+                         f'<span class=meta>(atual {com / 100:.2f}% / {com_out / 100:.2f}%; {"entrada no teto = (entrada + saída) − mínimo da regra do superior" if min_total(nome_sel) else "entrada no teto = taxa do cliente − piso"})</span></p></div>'
                          '<script>function abrirTaxaTenant(t){let b=document.querySelector("button[onclick^=abrirTaxa]");'
                          'fetch("/taxa-da-conversa?tenant="+t).then(r=>r.text()).then(h=>{document.getElementById("convbox").innerHTML=h})}</script>')
             except Exception as e:
@@ -2720,8 +2720,9 @@ function previaTaxa(){{let v=(document.getElementById('nova_taxa').value||'').re
   if(!ok){{pv.textContent='Formato: entrada/saída em %, ex.: 3.7/1';return null}}
   let ci=document.getElementById('com_in'),co=document.getElementById('com_out'),pout=+pv.dataset.pisoout||0;
   let mtx=+pv.dataset.min||0;
-  /* comissão de entrada acompanha a taxa (cliente − piso); saque mantém. Tenant com regra do superior: não mexe sozinho */
-  if(ci&&!ci.dataset.manual)ci.value=(mtx?+pv.dataset.com:Math.max(0,v[0]-pin)).toFixed(2);
+  /* comissão de entrada SEMPRE no teto: sem regra = taxa in − piso; com regra do superior = (in + out) − mínimo total. Saque mantém. */
+  let teto=mtx?Math.max(0,v[0]+v[1]-mtx):Math.max(0,v[0]-pin);
+  if(ci&&!ci.dataset.manual)ci.value=teto.toFixed(2);
   if(co&&!co.dataset.manual)co.value=(+pv.dataset.comout).toFixed(2);
   let txtCom=ci?' · comissão: in '+(+pv.dataset.com).toFixed(2)+'% → '+(+ci.value).toFixed(2)+'%, saque '+(+pv.dataset.comout).toFixed(2)+'% → '+(+co.value).toFixed(2)+'%':'';
   let mt=+pv.dataset.min||0;if(mt&&v[0]+v[1]<mt-1e-9){{pv.textContent='⛔ Regra do superior: mínimo de '+mt.toFixed(2)+'% no total (entrada + saída). Agora: '+(v[0]+v[1]).toFixed(2)+'%.';return null}}
