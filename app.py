@@ -1461,6 +1461,26 @@ def _alnum(t):
     return re.sub(r"[^a-z0-9]", "", t)
 
 
+def vazao_html(d):
+    """Volume real processado hoje (não é a capacidade máxima: limites/provedores são 403 p/ suporte)."""
+    cs, ps = d.get("chargeStats") or {}, d.get("payoutStats") or {}
+    h = sorted(cs.get("hourly") or [], key=lambda x: x.get("hour", 0))
+    if not h:
+        return ""
+    pico = max(h, key=lambda x: x.get("generated", 0))
+    cnt = lambda v: (v or {}).get("count", 0) if isinstance(v, dict) else (v or 0)
+    pagos = cnt(((ps.get("total") or {}).get("today") or {}).get("paid"))
+    horas_dia = max(1, datetime.now(TZ).hour + datetime.now(TZ).minute / 60)
+    tiles = [("Pico de entrada (média da hora)", f'{pico["generated"] / 3600:.1f}/s', f'{pico["hour"]:02d}h · {pico["generated"]:,} cobranças'.replace(",", ".")),
+             ("Pico de pagos", f'{pico.get("paid", 0) / 3600:.1f}/s', f'{pico["hour"]:02d}h'),
+             ("Saída (média do dia)", f"{pagos / (horas_dia * 3600):.1f}/s", f"{pagos:,} saques pagos hoje".replace(",", "."))]
+    t = "".join(f"<div class=tile><span>{n}</span><b>{v}</b><span>{x}</span></div>" for n, v, x in tiles)
+    graf = grafico_barras([(x["hour"], round(x["generated"] / 3600, 1)) for x in h], "cobranças/s", rotulo=lambda k: f"{k:02d}h")
+    return (f"<h3>Vazão de hoje (volume real, não é o limite)</h3><div class=tiles>{t}</div>"
+            f"<div class=card><h3>Cobranças por segundo, por hora</h3>{graf}"
+            "<p class=meta>Média de cada hora. O pico segundo a segundo é maior. A capacidade máxima depende de limites e provedores, que o perfil de suporte não vê: pergunte ao N2.</p></div>")
+
+
 def conversao(nome_conversa=""):
     """Conversão por tempo (dashboard de suporte, hoje). Usa a conta do cliente se o nome da conversa casar com um
     tenant com volume; senão a média da plataforma. Retorna dict com faixas cumulativas."""
@@ -1842,7 +1862,7 @@ def tempo_fmt(seg):
     return f"{seg // 60}min" if seg < 3600 else f"{seg // 3600}h{(seg % 3600) // 60:02d}"
 
 
-def grafico_barras(pontos, unidade):
+def grafico_barras(pontos, unidade, rotulo=None):
     """Barras verticais em SVG (uma série, sem legenda). Tooltip nativo por barra."""
     if not pontos:
         return "<p class=vazio>Sem dados.</p>"
@@ -1866,9 +1886,9 @@ def grafico_barras(pontos, unidade):
         h = (v / mx) * 170
         barras.append(f'<g class=bar><rect x="{x - (passo - larg) / 2:.1f}" y="10" width="{passo:.1f}" height="{base - 10}" fill="transparent"/>'
                       f'<path d="M{x:.1f},{base} v{-max(h - 4, 0):.1f} q0,-4 {min(4, larg / 2):.1f},-4 h{max(larg - 8, 0):.1f} q{min(4, larg / 2):.1f},0 {min(4, larg / 2):.1f},4 v{max(h - 4, 0):.1f} z" class=mk '
-                      f'{"" if v else "style=\"display:none\""} /><title>{d.strftime("%d/%m")}: {v:g} {unidade}</title></g>')
+                      f'{"" if v else "style=\"display:none\""} /><title>{(rotulo or (lambda k: k.strftime("%d/%m")))(d)}: {v:g} {unidade}</title></g>')
         if i % cada == 0:
-            rot.append(f'<text x="{x + larg / 2:.1f}" y="{base + 16}" class=ax text-anchor=middle>{d.strftime("%d/%m")}</text>')
+            rot.append(f'<text x="{x + larg / 2:.1f}" y="{base + 16}" class=ax text-anchor=middle>{(rotulo or (lambda k: k.strftime("%d/%m")))(d)}</text>')
     return (f'<svg viewBox="0 0 {W} {H + 10}" class=chart role=img aria-label="{unidade} por dia">{grade}'
             f'<line x1="{esq}" x2="{W}" y1="{base}" y2="{base}" class=bl />{"".join(barras)}{"".join(rot)}</svg>')
 
@@ -2274,6 +2294,38 @@ No iPhone pelo controle remoto, o Safari não permite notificação fora da pág
             return self.insights({k: v[0] for k, v in urllib.parse.parse_qs(url.query).items()}, filtro)
         if url.path == "/insights/exportar":
             return self.exportar({k: v[0] for k, v in urllib.parse.parse_qs(url.query).items()})
+        if url.path == "/taxa-da-conversa":
+            qv = urllib.parse.parse_qs(url.query)
+            nome = qv.get("nome", [""])[0]
+            try:
+                lista = taxas_lista()
+                nc = _alnum(nome)
+                cand = sorted((x for x in lista if len(_alnum(x["tenantName"])) >= 4 and _alnum(x["tenantName"]) in nc),
+                              key=lambda x: -len(_alnum(x["tenantName"])))
+                sel = cand[0]["tenantId"] if cand else ""
+                if RE_CONV.match(qv.get("tenant", [""])[0]):
+                    sel = qv["tenant"][0]  # trocou o tenant no select
+                ops = "".join(f'<option value="{html.escape(x["tenantId"])}" {"selected" if x["tenantId"] == sel else ""}>{html.escape(x["tenantName"])}</option>'
+                              for x in sorted(lista, key=lambda x: x["tenantName"].lower()))
+                atual, piso_in, com = "", 0, 0
+                if sel:
+                    det = tamino_get(f"/admin/fee-pricing/tenants/{sel}") or {}
+                    b, m = det.get("base") or {}, det.get("manager") or {}
+                    atual = f'Atual: Pix in {fmt_taxa(b.get("in"))} · saque {fmt_taxa(b.get("out"))} · gerente {m.get("name") or "—"}'
+                    piso_in = (((m.get("floor") or {}).get("in")) or {}).get("percentageBps") or 0
+                    com = ((m.get("markup") or {}).get("inBps")) or 0
+                aviso = "" if sel else "<p class=alerta>Não achei o tenant pelo nome do grupo: escolha na lista.</p>"
+                corpo = (f'<div class=card>{aviso}<p>Tenant <select id=tenant_taxa onchange="abrirTaxaTenant(this.value)">{ops if sel else "<option value=\"\">escolha…</option>" + ops}</select></p>'
+                         f'<p class=meta>{html.escape(atual)}</p>'
+                         f'<p>Nova taxa (entrada/saída em %): <input id=nova_taxa placeholder="3.7/1" oninput="previaTaxa()" style="width:110px"> '
+                         f'<button type=button onclick="salvarTaxaConversa()">Salvar no Tamino</button></p>'
+                         f'<p id=prev_taxa class=meta data-pisoin="{piso_in / 100}" data-com="{com / 100}"></p></div>'
+                         '<script>function abrirTaxaTenant(t){let b=document.querySelector("button[onclick^=abrirTaxa]");'
+                         'fetch("/taxa-da-conversa?tenant="+t).then(r=>r.text()).then(h=>{document.getElementById("convbox").innerHTML=h})}</script>')
+            except Exception as e:
+                corpo = f"<p class=alerta>Falhou: {html.escape(str(e))}</p>"
+            self._html(corpo)
+            return
         if url.path == "/consultar-ids":
             cid = urllib.parse.parse_qs(url.query).get("conv", [""])[0]
             try:
@@ -2411,7 +2463,7 @@ No iPhone pelo controle remoto, o Safari não permite notificação fora da pág
             linhas.append([html.escape(x.get("tenantName", "")), html.escape(str(num(h.get("generated")))), html.escape(str(num(h.get("paid")))),
                            f'{h.get("successRate", "—")}%', f'{h.get("avgSecondsToPay", "—")}s'])
         self._pg("Dashboard", "/dashboard", f"""<h2>Dashboard</h2><p class=meta>Atualizado {hora(d.get("generatedAt"))} · rodando agora: {rodando or "—"}</p>
-<div class=tiles>{t}</div><h3>Conversão por tempo (hoje)</h3>{conversao_tabela(conversao())}<h3>Cobranças hoje por tenant</h3>{tabela(["Tenant", "Geradas", "Pagas", "Conversão", "Tempo médio"], linhas)}""", filtro)
+<div class=tiles>{t}</div>{vazao_html(d)}<h3>Conversão por tempo (hoje)</h3>{conversao_tabela(conversao())}<h3>Cobranças hoje por tenant</h3>{tabela(["Tenant", "Geradas", "Pagas", "Conversão", "Tempo médio"], linhas)}""", filtro)
 
     def saques(self, qs, filtro):
         q = qs.get("q", "").strip()
@@ -2621,6 +2673,20 @@ fetch('/consultar-ids?conv={cid}').then(r=>r.json()).then(d=>{{b.disabled=false;
   if(d.erro){{box.textContent='Falhou: '+d.erro;return}}
   box.innerHTML=d.tabela;if(d.texto)document.getElementById('txc').value=d.texto}})
 .catch(()=>{{b.disabled=false;b.textContent='🔎 Consultar IDs'}})}}
+function abrirTaxa(b){{b.disabled=true;
+fetch('/taxa-da-conversa?conv={cid}&nome='+encodeURIComponent({json.dumps(nome)})).then(r=>r.text()).then(h=>{{b.disabled=false;
+  document.getElementById('convbox').innerHTML=h;sujo=true;let i=document.getElementById('nova_taxa');if(i)i.focus()}})}}
+function previaTaxa(){{let v=(document.getElementById('nova_taxa').value||'').replace(/,/g,'.').split('/').map(x=>parseFloat(x));
+  let ok=v.length===2&&v.every(x=>!isNaN(x)&&x>=0),pv=document.getElementById('prev_taxa'),pin=+pv.dataset.pisoin,com=+pv.dataset.com;
+  if(!ok){{pv.textContent='Formato: entrada/saída em %, ex.: 3.7/1';return null}}
+  let av=[];if(v[0]<pin)av.push('entrada abaixo do piso ('+pin.toFixed(2)+'%)');if(com>v[0]-pin+1e-9)av.push('comissão do gerente ('+com.toFixed(2)+'%) passa da margem ('+(v[0]-pin).toFixed(2)+'%): ajuste em Taxas');
+  pv.textContent='Novo: Pix in '+v[0].toFixed(2)+'% · saque '+v[1].toFixed(2)+'%'+(av.length?'  ⚠ '+av.join('; '):'  ✓ dentro do piso e da margem');return v}}
+function salvarTaxaConversa(){{let v=previaTaxa();if(!v)return;let tid=document.getElementById('tenant_taxa').value,tn=document.getElementById('tenant_taxa').selectedOptions[0].text;
+  if(!confirm('Alterar a taxa REAL do tenant '+tn+' para Pix in '+v[0].toFixed(2)+'% e saque '+v[1].toFixed(2)+'%?\\n\\n'+document.getElementById('prev_taxa').textContent))return;
+  fetch('/',{{method:'POST',headers:{{'content-type':'application/x-www-form-urlencoded'}},body:'t={TOKEN}&acao=taxa_rapida&tenant='+tid+'&in_pct='+v[0]+'&out_pct='+v[1]+'&lang={idioma(cid, hist)}'}})
+  .then(r=>r.json()).then(d=>{{let box=document.getElementById('convbox');
+    if(d.erro){{box.insertAdjacentHTML('beforeend','<p class=alerta>Não salvou: '+d.erro+'</p>');return}}
+    box.insertAdjacentHTML('beforeend','<p class=ok-msg>✅ Salvo. Agora: Pix in '+d.in_+' · saque '+d.out+'</p>');document.getElementById('txc').value=d.msg}})}}
 function conviteDaConversa(b){{b.disabled=true;b.textContent='✉️ procurando…';
 fetch('/convite-da-conversa?conv={cid}').then(r=>r.json()).then(d=>{{b.disabled=false;b.textContent='✉️ Reenviar convite';
   let box=document.getElementById('convbox');
@@ -2646,7 +2712,8 @@ function apagarMsg(id){{if(confirm('Apagar esta mensagem? Ela some para o client
   <div class=corr><button type=button class=sec onclick="verConversao(this)">📊 Conversão</button>
   <button type=button class=sec onclick="verWebhook(this)">📨 Média webhook</button>
   <button type=button class=sec onclick="conviteDaConversa(this)">✉️ Reenviar convite</button>
-  <button type=button onclick="consultarIds(this)">🔎 Consultar IDs</button></div><div id=convbox></div>
+  <button type=button onclick="consultarIds(this)">🔎 Consultar IDs</button>
+  <button type=button class=sec onclick="abrirTaxa(this)">💲 Alterar taxa</button></div><div id=convbox></div>
   <textarea name=texto id=txc rows=4 spellcheck=true lang=pt-BR placeholder="Escreva a mensagem…"></textarea>{botao_corrigir("txc", idioma(cid, hist))}
   <label class=anexar>📎 Anexar <input type=file name=arquivo multiple onchange="document.getElementById('anx').textContent=[...this.files].map(f=>f.name).join(', ');sujo=true"></label>
   <span id=anx class=meta></span>
@@ -2724,6 +2791,38 @@ function apagarMsg(id){{if(confirm('Apagar esta mensagem? Ela some para o client
             if RE_CONV.match(cid):
                 salvar_idioma(cid, f.get("lang", ""))
             return self._ir(f"/c/{volta}?f={filtro}" if RE_CONV.match(volta) else f"/?f={filtro}")
+        if acao == "taxa_rapida":
+            tid = f.get("tenant", "")
+            try:
+                if not RE_CONV.match(tid):
+                    raise ValueError("escolha o tenant")
+                novo = {"in": float(f.get("in_pct")), "out": float(f.get("out_pct"))}
+                if not all(0 <= v <= 100 for v in novo.values()):
+                    raise ValueError("valores fora de 0 a 100%")
+                atual = tamino_get(f"/admin/fee-pricing/tenants/{tid}") or {}
+                for d_, v in novo.items():
+                    b = (atual.get("base") or {}).get(d_) or {}
+                    tamino_post(f"/admin/fee-pricing/tenants/{tid}/base/{d_}", {
+                        "percentageBps": int(round(v * 100)), "fixedAmountInCents": b.get("fixedAmountInCents"),
+                        "minAmountInCents": b.get("minAmountInCents"), "maxAmountInCents": b.get("maxAmountInCents")}, metodo="PUT")
+                registrar_acao("taxa_alterada", tid)
+                _TAXAS["t"] = 0
+                depois = (tamino_get(f"/admin/fee-pricing/tenants/{tid}") or {}).get("base") or {}
+                fi, fo = fmt_taxa(depois.get("in")), fmt_taxa(depois.get("out"))
+                lang = f.get("lang", "pt")
+                msg = {"pt": f"Prontinho! A taxa de vocês já foi ajustada para {fi} no Pix in e {fo} no saque.",
+                       "en": f"Done! Your rate has been adjusted to {fi} on Pix in and {fo} on payouts.",
+                       "es": f"¡Listo! Su tasa ya fue ajustada a {fi} en Pix in y {fo} en retiros.",
+                       "zh": f"已完成！您的费率已调整为 Pix 收款 {fi}，提现 {fo}。"}.get(lang, "")
+                corpo = {"in_": fi, "out": fo, "msg": msg.replace(",00%", "%")}
+            except Exception as e:
+                corpo = {"erro": str(e)}
+            dados = json.dumps(corpo, ensure_ascii=False).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(dados)
+            return
         if acao in ("taxa_base", "taxa_comissao"):
             tid = f.get("tenant", "")
             if not RE_CONV.match(tid):
