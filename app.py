@@ -1461,21 +1461,24 @@ def _alnum(t):
     return re.sub(r"[^a-z0-9]", "", t)
 
 
-REGRA_MIN_PADRAO = "cepay = 3.4"
+REGRA_MIN_PADRAO = "* = 3.4"  # "*" = todos os tenants; uma linha "nome = x" sobrepõe para aquele tenant
 
 
 def min_total(nome_tenant):
     """Mínimo de entrada% + saída% definido pelo superior (🔧 → Regras de taxa). None se não houver regra."""
-    alvo = _alnum(nome_tenant)
+    alvo, geral = _alnum(nome_tenant), None
     for linha in cfg("taxa_min_total", REGRA_MIN_PADRAO).splitlines():
         if "=" in linha:
             n, v = linha.split("=", 1)
             try:
-                if _alnum(n) and _alnum(n) == alvo:
-                    return float(v.strip().replace(",", "."))
+                val = float(v.strip().replace(",", "."))
             except ValueError:
-                pass
-    return None
+                continue
+            if n.strip() == "*":
+                geral = val
+            elif _alnum(n) and _alnum(n) == alvo:
+                return val
+    return geral
 
 
 def checar_min_total(tid, nome, novo_in, novo_out):
@@ -2184,8 +2187,9 @@ No iPhone pelo controle remoto, o Safari não permite notificação fora da pág
 
 <div class=card><h3>🔒 Regras de taxa (mínimo total)</h3><form method=post>{T}
 <textarea name=taxa_min_total rows=3 spellcheck=false>{html.escape(cfg("taxa_min_total", REGRA_MIN_PADRAO))}</textarea>
-<p class=meta>Uma linha por tenant: <code>nome = mínimo%</code>. O painel bloqueia salvar quando entrada + saída ficar abaixo do mínimo
-(ex.: cepay 3/0.3 = 3,3% é bloqueado; 3/1 = 4% passa).</p>
+<p class=meta><code>* = 3.4</code> vale para todos os tenants; uma linha <code>nome = mínimo%</code> muda só aquele tenant.
+O painel bloqueia salvar quando entrada + saída ficar abaixo do mínimo (ex.: 3/0.3 = 3,3% é bloqueado; 3/1 = 4% passa),
+e a comissão do gerente vai no teto: (entrada + saída) − mínimo.</p>
 <button name=acao value=config_regras>Salvar</button></form></div>
 
 <div class=card><h3>🕗 Horário de trabalho</h3><form method=post>{T}
@@ -3093,7 +3097,7 @@ abd4161e-c248-48bb-a38c-1fdad3fd7e4b
     assert dia_turno(ts(19, 20)) == date(2026, 11, 19) and dia_turno(ts(20, 3, 59)) == date(2026, 11, 19)
     assert dia_turno(ts(20, 4)) is None and dia_turno(ts(20, 15)) is None and dia_turno(ts(20, 23)) == date(2026, 11, 20)
     assert "{" not in msg_ponto("entrada")
-    assert min_total("cepay") == 3.4 and min_total("outro") is None
+    assert min_total("cepay") == 3.4 and min_total("qualquer") == 3.4
     try:
         checar_min_total("x", "cepay", 3.0, 0.3)
         assert False, "deveria bloquear"
