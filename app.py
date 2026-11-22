@@ -5,6 +5,9 @@ Uso:
   uv run --with 'mcp>=2,<3' app.py mcp   # servidor MCP (stdio) para o agente
   uv run app.py painel              # painel em http://127.0.0.1:8765
   uv run app.py teste               # self-check
+  uv run app.py importar            # backup de todo o histórico do Evo no banco local
+  uv run app.py memorias            # memória de todas as conversas do backup local (retomável; usa IA)
+  uv run app.py casos               # segmenta o backup em casos pergunta/resposta (por autor)
 Config: .env ao lado deste arquivo (ver .env.example).
 """
 import html
@@ -492,6 +495,15 @@ def db():
                  backend text, ok int, causa text, ms int, tokens_in int, tokens_out int)""")
     c.execute("""create table if not exists classificacoes(conversa text primary key, categoria text, sentimento text,
                  prioridade int, motivo text, ate_msg text, atualizado real)""")
+    # cópia local de todo o histórico do Evo (texto cru): base da memória e dos casos do treinamento
+    c.execute("""create table if not exists mensagens(id text primary key, conversa text not null, nome_conv text, ts real,
+                 tipo text, autor text, autor_id text, texto text, privada int default 0, reply text)""")
+    c.execute("create index if not exists mensagens_conv on mensagens(conversa, ts)")
+    # treinamento: pergunta/resposta (importado do Evo ou disparado pelo painel) e a escolha A/B de cada rascunho (versões mascaradas)
+    c.execute("""create table if not exists casos(id integer primary key, conversa text, nome_conv text, msg_pergunta text, pergunta text,
+                 resposta text, autor text, ids text, origem text, variante text, editado real, ts real,
+                 unique(conversa, msg_pergunta, origem))""")
+    c.execute("create table if not exists escolhas(rascunho_id integer primary key, conversa text, ts real, variante text, editado real, versoes text)")
     if "nome" not in [r[1] for r in c.execute("pragma table_info(rascunhos)")]:
         c.execute("alter table rascunhos add column nome text")
     c.commit()
@@ -561,14 +573,16 @@ def preparar_resposta(conv, ids=None, tenant_esperado=None, nome=None, historico
         resposta_n2 = viva["resposta"] or ""  # card refeito (o anterior foi substituído) não perde a resposta do N2
     memoria = memoria_para_prompt(conv)
     from concurrent.futures import ThreadPoolExecutor
-    with ThreadPoolExecutor(2) as ex:  # as duas versões em paralelo
+    with ThreadPoolExecutor(3) as ex:  # as três versões em paralelo
         lang = idioma_salvo(conv)  # só força se o usuário escolheu; senão a IA segue o idioma do cliente
         fi = ex.submit(redigir, historico, resumos, "info", lang, memoria, resposta_n2, conv)
+        fb = ex.submit(redigir, historico, resumos, "info_b", lang, memoria, resposta_n2, conv) if resumos else None  # A/B só com dados
         fg = ex.submit(redigir, historico, resumos, "generico", lang, conv=conv)
-        versoes = {"info": fi.result(), "generico": fg.result()}
-    if None in versoes.values():  # antes de separar: resposta só com o marcador [[N2]] não é falha da IA
+        versoes = {"info": fi.result(), "info_b": fb.result() if fb else None, "generico": fg.result()}
+    if None in (versoes["info"], versoes["generico"]):  # a B (A/B) pode faltar sem alerta; antes de separar: resposta só com [[N2]] não é falha da IA
         alertas.append(f"A IA falhou ({causa_ia_recente(conv)}): usei o texto padrão. Responda à mão ou escale ao N2.")
-    versoes["info"], esc = separar_escalada(versoes["info"])
+    versoes["info"], esc = separar_escalada(versoes["info"])  # o marcador de escalação vale só da A
+    versoes["info_b"], _ = separar_escalada(versoes["info_b"])
     versoes["generico"], _ = separar_escalada(versoes["generico"])
     erros = [r["erro"] for r in resumos if r.get("erro")]
     if "no_access" in erros:  # o código manda sobre o marcador
@@ -585,12 +599,13 @@ def preparar_resposta(conv, ids=None, tenant_esperado=None, nome=None, historico
         esc = None
     versoes["info"] = versoes["info"] or (montar_texto(resumos) if resumos else MSG_ESPERA)
     versoes["generico"] = versoes["generico"] or MSG_ESPERA
+    versoes = {k: v for k, v in versoes.items() if v}  # sem B (falhou ou só tinha o marcador), o card segue como era
     # só avisa, nunca bloqueia: o clique continua do atendente. O E2E que o próprio texto montado cita também é do cliente.
     entrada = " ".join(m["texto"] or "" for m in historico if m["tipo"] == "incoming")  # o que o próprio cliente mandou
     permitidos = (list(ids) + extrair_ids(entrada) + RE_EMAIL.findall(entrada)
                   + [i["endToEndId"] for r in resumos for i in r["itens"] if i.get("endToEndId")])
     pergunta = next((m["texto"] for m in reversed(historico) if m["tipo"] == "incoming"), "")
-    sigilo = {k: checar_sigilo(versoes[k], nome, permitidos, pergunta) for k in ("info", "generico")}
+    sigilo = {k: checar_sigilo(v, nome, permitidos, pergunta) for k, v in versoes.items()}
     sigilo = {k: v for k, v in sigilo.items() if v}
     alertas += [f"⚠ viola sigilo ({k}): {', '.join(v)}" for k, v in sigilo.items()]
     if esc and esc["motivo"] == "pending_clarification":
@@ -800,11 +815,14 @@ def mem_gravar(conv, **campos):
     with db() as c:
         c.execute(f"insert into memorias(conversa,{','.join(v)}) values(?{',?' * len(v)}) on conflict(conversa) do update set "
                   + ",".join(f"{k}=excluded.{k}" for k in v), (conv, *v.values()))
+    if any(k in v for k in (*MEM_LISTAS, *MEM_TEXTOS)):  # carimbo e ate_msg não mudam a nota
+        exportar_obsidian(conv)
 
 
 def mem_limpar(conv):
     with db() as c:
         c.execute("delete from memorias where conversa=?", (conv,))
+    apagar_nota_obsidian(conv)
 
 
 def memoria_para_prompt(conv):
@@ -845,47 +863,29 @@ primeiros caracteres. Sem novidade relevante, devolva a memória atual igual."""
 
 def atualizar_memoria(conv, final=False, forcar=False):
     """Reescreve a memória com as mensagens desde ate_msg. forcar = botão "Atualizar agora" (vale com memoria_auto desligado)."""
-    if (not forcar and cfg("memoria_auto", "0") != "1") or sem_memoria(conv):
+    if (not forcar and cfg("memoria_auto", "1") != "1") or sem_memoria(conv):
         return False
     mem = mem_ler(conv)
     mem_gravar(conv)  # carimba antes: se o Evo falhar sempre, a varredura passa para a próxima
     hist = evo_historico(conv)
-    # shortcut: só as 20 últimas mensagens; se passar disso entre duas atualizações, paginar com antes_de.
     ids = [str(m["id"]) for m in hist]
-    novas = [m for m in (hist[ids.index(mem["ate_msg"]) + 1:] if mem["ate_msg"] in ids else hist)
-             if m["texto"] and m["tipo"] in ("incoming", "outgoing") and not m.get("privada")]  # nota interna não vira memória
-    if not novas and not final:
-        mem_gravar(conv)  # carimba: a varredura não pega a mesma conversa de novo
-        return False
-    rotulos = {}
-    for m in novas:
-        if m["tipo"] == "incoming" and m["nome"] not in rotulos:
-            rotulos[m["nome"]] = "CLIENTE " + chr(65 + len(rotulos) % 26)
-    def linha(m):
-        t = uma_linha(m["texto"])
-        for n, r in rotulos.items():
-            t = t.replace(n, r) if len(n) >= 3 else t
-        return f"{rotulos.get(m['nome'], 'CLIENTE') if m['tipo'] == 'incoming' else 'SUPORTE'}: {sem_tag(mascarar(t))[:500]}"
-    atual = json.dumps({k: mem[k] for k in ("resumo", "pendencias", "fatos")}, ensure_ascii=False)
-    pedido = (f"<memoria_atual>\n{sem_tag(atual)}\n</memoria_atual>\n<mensagens_novas>\n"
-              + "\n".join(linha(m) for m in novas) + "\n</mensagens_novas>\n"
-              + ("A conversa foi concluída: esvazie as pendências resolvidas.\n" if final else "") + "Devolva o JSON.")
-    out = ia(pedido, SISTEMA_MEMORIA, tipo="memoria", conv=conv) or ""
-    try:
-        d = json.loads(out[out.find("{"):out.rfind("}") + 1])
-        ok = isinstance(d, dict) and isinstance(d.get("resumo"), str) and all(isinstance(d.get(k), list) for k in MEM_LISTAS)
-    except ValueError:
-        ok = False
-    if not ok:
-        mem_gravar(conv)  # JSON inválido: mantém a memória e não repete a cada varredura
-        return False
-    mem_gravar(conv, resumo=d["resumo"], pendencias=d["pendencias"], fatos=d["fatos"], ate_msg=str(hist[-1]["id"]) if hist else None)
-    return True
+    if mem["ate_msg"] in ids:
+        novas = hist[ids.index(mem["ate_msg"]) + 1:]
+    elif not mem["ate_msg"]:
+        novas = hist  # 1ª memória automática: só as 20 últimas (rode `uv run app.py memorias` antes para usar o histórico inteiro)
+    else:  # ate_msg ficou além das 20 últimas do Evo: o que falta está no backup local; o que o backup ainda não tem vem do Evo
+        salvas = mensagens_de(conv)
+        sids = [str(m["id"]) for m in salvas]
+        if mem["ate_msg"] in sids:
+            novas = salvas[sids.index(mem["ate_msg"]) + 1:] + [m for m in hist if str(m["id"]) not in sids]
+        else:  # buraco (painel desligado e backup sem a msg): segue das 20 últimas, sem reler tudo por cima da memória
+            novas = hist
+    return _mesclar_em_blocos(conv, novas, 40, final) > 0
 
 
 def varrer_memorias():
     """No máx. 1 por varredura: conversa com envio pelo painel nas últimas 24 h e memória mais velha que o envio."""
-    if cfg("memoria_auto", "0") != "1":
+    if cfg("memoria_auto", "1") != "1":
         return None
     with db() as c:
         rows = c.execute(f"""select a.conv, max(a.ts) t from acoes a left join memorias m on m.conversa=a.conv
@@ -948,6 +948,9 @@ MODOS = {
                  "NÃO cite IDs, status, valores, motivos nem prazos. Varie a frase, no idioma do cliente. "
                  "Nunca use o marcador [[N2:...]]."),
 }
+ESTILO_B = "Redação mais curta e direta: 1 a 2 frases, sem saudação."  # variante B do A/B: troque aqui para testar outro estilo
+# mesmas regras do informativo; o rótulo muda para o texto da A não aparecer inteiro no pedido da B
+MODOS["info_b"] = MODOS["info"].replace("INFORMATIVO", "INFORMATIVO B", 1) + " Estilo desta versão: " + ESTILO_B
 
 
 def redigir(historico, resumos, modo="info", lang=None, memoria="", resposta_n2="", conv=""):
@@ -1273,7 +1276,62 @@ def meu_id():
         return None
 
 
+def salvar_mensagens(conv, nome, hist):
+    """Upsert no backup local (texto editado/apagado no Evo é atualizado); devolve quantas linhas eram novas."""
+    linhas = [(str(m["id"]), conv, nome, m["ts"], m["tipo"], m["nome"], str(m.get("autor_id") or ""), "" if m.get("apagada") else m["texto"],
+               int(bool(m.get("privada"))), str(m.get("reply") or "")) for m in hist if m.get("id")]
+    with db() as c:
+        antes = c.execute("select count(*) from mensagens where conversa=?", (conv,)).fetchone()[0]
+        c.executemany("insert into mensagens values(?,?,?,?,?,?,?,?,?,?) on conflict(id) do update set texto=excluded.texto", linhas)
+        return c.execute("select count(*) from mensagens where conversa=?", (conv,)).fetchone()[0] - antes
+
+
+def mensagens_de(conv):
+    """Histórico salvo, mais antiga primeiro, no mesmo formato de evo_historico (sem anexos)."""
+    with db() as c:
+        rows = c.execute("select id,tipo,autor,ts,autor_id,texto,privada,reply from mensagens where conversa=? order by ts, rowid",
+                         (conv,)).fetchall()
+    return [{"id": i, "tipo": t, "nome": a, "ts": ts, "autor_id": ai, "texto": tx or "", "privada": bool(p), "reply": r or None,
+             "hora": datetime.fromtimestamp(ts, TZ).strftime("%d/%m %H:%M") if ts else "", "anexos": []}
+            for i, t, a, ts, ai, tx, p, r in rows]
+
+
+def importar_conversa(conv, nome, limite=3000):
+    """Puxa o histórico INTEIRO da conversa (páginas de 20 para trás) e salva. Devolve (lidas, novas)."""
+    hist = evo_historico(conv)
+    lidas, novas, vistos = len(hist), salvar_mensagens(conv, nome, hist), {str(m["id"]) for m in hist}
+    while hist and lidas < limite:
+        hist = [m for m in evo_historico(conv, antes_de=str(hist[0]["id"])) if str(m["id"]) not in vistos]
+        if not hist:
+            break
+        vistos |= {str(m["id"]) for m in hist}
+        lidas += len(hist)
+        novas += salvar_mensagens(conv, nome, hist)
+    if lidas >= limite:
+        log(f"[backup] {conv[:8]}: parei em {limite} mensagens; as mais antigas ficaram de fora")
+    return lidas, novas
+
+
+def importar_tudo(status="all"):
+    """Backup de todas as conversas do Evo para a tabela mensagens. Só leitura no Evo. {conv: (nome, lidas, novas)}."""
+    saida, pagina = {}, 1
+    while True:
+        convs, total = evo_buscar(status=status, page=pagina)
+        if all(cv.get("id") in saida for cv in convs):
+            return saida  # página repetida: a API não respeitou page
+        for cv in convs:
+            nome = (cv.get("contact") or {}).get("name") or ""
+            try:
+                saida[cv["id"]] = (nome, *importar_conversa(cv["id"], nome))
+            except Exception as e:
+                log(f"[backup] {str(cv.get('id'))[:8]}: {e}")
+        if not convs or (total and len(saida) >= total):
+            return saida
+        pagina += 1
+
+
 def registrar_msgs(conv, nome, hist):
+    sem_falhar(salvar_mensagens, conv, nome, hist)  # backup contínuo: toda mensagem que o vigia vê fica salva
     eu = meu_id()
     with db() as c:
         c.executemany("insert or ignore into msgs values(?,?,?,?,?,?)",
@@ -2192,8 +2250,9 @@ def versoes_html(rid, det, atual, lang="pt"):
     if v:
         sg = det_json(det).get("sigilo") or {}
         selo = lambda k: f' <span class="sb er" title="{html.escape(", ".join(sg[k]), quote=True)}">⚠ viola sigilo</span>' if sg.get(k) else ""
-        vs = (botao_texto(alvo, v.get("info"), "📋 Informativo" + selo("info"), v.get("info") == atual)
-              + botao_texto(alvo, v.get("generico"), "⏳ Genérico (segurar)" + selo("generico"), v.get("generico") == atual))
+        vs = (botao_texto(alvo, v.get("info"), "🅰 Informativo A" + selo("info"), v.get("info") == atual)
+              + (botao_texto(alvo, v["info_b"], "🅱 Informativo B" + selo("info_b"), v["info_b"] == atual) if v.get("info_b") else "")  # card antigo não tem B
+              + botao_texto(alvo, v.get("generico"), "⏳ Genérico" + selo("generico"), v.get("generico") == atual))
     return f'<div class=lbls>{vs}{rapidas_html(alvo, lang)}</div>'
 
 
@@ -2676,6 +2735,7 @@ ligue só em rede confiável. Desligar desconecta todos os celulares.</p>"""
 <div class=card><h3>Mensagens enviadas por hora do expediente</h3>{grafico_horas(d["por_hora"])}</div>
 <div class=card><h3>Conversas mais atendidas</h3>{tabela(["Conversa", "Enviadas", "Recebidas"],
             [[html.escape(n or "?"), e, r] for n, e, r in d["top"]])}</div>
+{treino_html()}
 <p class=meta>Conta só o que foi feito pelo painel (envios, rascunhos disparados, conclusões), desde {d["desde"]}. Mensagens enviadas direto no Evo não entram. Tempo ativo: minutos com o painel aberto e em uso.</p></div>"""
         if imprimir:
             corpo += "<style>.marca,.status,.abas,.feed,.fab{display:none!important}.grid{grid-template-columns:1fr!important}</style>"
@@ -2761,15 +2821,18 @@ e a comissão do gerente vai no teto: (entrada + saída) − mínimo.</p>
 <button name=acao value=config_n2>Salvar</button></form></div>
 
 <div class=card><h3>🧠 Memória das conversas</h3><form method=post>{T}
-<p><label><input type=checkbox name=memoria_auto value=1 {"checked" if cfg("memoria_auto", "0") == "1" else ""}> Atualizar sozinho (a cada 10 min, 1 conversa por vez, só as que tiveram envio pelo painel nas últimas 24 h)</label></p>
-<p class=meta>Desligado por padrão: guardar resumo de conversa de cliente ainda depende da autorização do superior. "Atualizar agora" no card 🧠 da conversa funciona mesmo desligado.
+<p><label><input type=checkbox name=memoria_auto value=1 {"checked" if cfg("memoria_auto", "1") == "1" else ""}> Atualizar sozinho (a cada 10 min, 1 conversa por vez, só as que tiveram envio pelo painel nas últimas 24 h)</label></p>
+<p class=meta>Ligado por padrão; desmarque e salve para desligar. "Atualizar agora" no card 🧠 da conversa funciona mesmo desligado.
 {self.n_memorias()} memória(s) guardada(s), mascaradas. Grupo N2 e conversas ignoradas nunca ganham memória.</p>
+<p>Pasta do Obsidian <input type=search name=vault_obsidian value="{html.escape(cfg("vault_obsidian", VAULT_PADRAO))}" style="width:100%"></p>
+<p class=meta>Cada memória vira uma nota em <code>Conversas/</code> dentro dessa pasta, mais o índice <code>Tamino - Conversas.md</code>. Vazio = não exporta.
+Limpar a memória, apagar todas ou 🗑 Esquecer cliente apaga a nota.</p>
 <button name=acao value=config_memoria>Salvar</button> <button name=acao value=config_memoria_apagar class=sec onclick="return confirm('Apagar TODAS as memórias? Não dá para desfazer.')">Apagar todas as memórias</button></form></div>
 
 <div class=card><h3>🗑 Retenção de dados</h3><form method=post>{T}
 <p>Apagar dados com mais de <input type=number name=retencao_dias min=0 max=9999 value="{html.escape(cfg("retencao_dias", "180"))}" style="width:90px"> dias (0 = nunca apagar)</p>
 <p class=meta>Vale para memórias, escalações encerradas, rascunhos já tratados, mensagens registradas e ações dos Insights. Roda a cada hora com o painel aberto;
-escalação viva e rascunho pendente ficam. Para apagar uma conversa só, use 🗑 Esquecer cliente na página dela.</p>
+escalação viva e rascunho pendente ficam. O backup do histórico e os casos do treino não expiram: para apagar uma conversa, use 🗑 Esquecer cliente na página dela.</p>
 <button name=acao value=config_retencao>Salvar</button></form></div>
 
 <div class=card><h3>💬 Respostas rápidas</h3><form method=post>{T}
@@ -2823,12 +2886,15 @@ escalação viva e rascunho pendente ficam. Para apagar uma conversa só, use �
         elif a == "config_n2" and f.get("grupo_n2", "").strip():
             cfg_salvar(grupo_n2=f["grupo_n2"].strip(), conv_n2="")  # id velho mandaria ao grupo antigo
         elif a == "config_memoria":
-            cfg_salvar(memoria_auto="1" if f.get("memoria_auto") == "1" else "0")
+            cfg_salvar(memoria_auto="1" if f.get("memoria_auto") == "1" else "0", vault_obsidian=f.get("vault_obsidian", "").strip()[:300])
         elif a == "config_retencao" and re.fullmatch(r"\d{1,4}", f.get("retencao_dias", "").strip()):
             cfg_salvar(retencao_dias=int(f["retencao_dias"].strip()))
         elif a == "config_memoria_apagar":
             with db() as c:
+                convs = [r[0] for r in c.execute("select conversa from memorias")]
                 c.execute("delete from memorias")
+            for conv in convs:
+                apagar_nota_obsidian(conv)
         elif a == "config_rapidas":
             edit = {}
             for k, v in f.items():
@@ -3631,6 +3697,7 @@ function apagarMsg(id){{if(confirm('Apagar esta mensagem? Ela some para o client
             elif r:
                 c.execute("update rascunhos set status='descartado' where id=?", (f["id"],))
         if r:  # fora do with: a conexão acima já segura a escrita
+            sem_falhar(registrar_escolha, f["id"], texto if acao == "enviar" else None)  # o envio já saiu: o registro não pode falhar a resposta
             sem_falhar(fechar_escalada, r[0])
             e = sem_falhar(escalada_de, r[0])
             if acao == "enviar" and e and e["status"] == "aberta":
@@ -4047,6 +4114,7 @@ def _teste_classifica():
         g.update(ia=ia0, evo_historico=hist0, em_segundo_plano=em0)
         cfg_salvar(rascunho_auto="1", classificar_auto="1")
 # ---------- retenção e esquecimento ----------
+SEM_EXPURGO = ("mensagens", "casos")  # backup e base do treino: o usuário quer o histórico inteiro; só "esquecer" apaga
 FILTRO_EXPURGO = {"escalacoes": "status in ('resolvida','cancelada')", "rascunhos": "status != 'pendente'"}  # vivas e pendentes ficam
 
 
@@ -4077,8 +4145,12 @@ def expurgar(dias=None):
         except OSError:
             pass  # sumiu no meio: não derruba o expurgo do banco
     with db() as c:
+        velhas = [r[0] for r in c.execute("select conversa from memorias where atualizado < ?", (corte,))]
+    for conv in velhas:
+        sem_falhar(apagar_nota_obsidian, conv)
+    with db() as c:
         for t, _, tempo in tabelas_conv(c):
-            if tempo:
+            if tempo and t not in SEM_EXPURGO:
                 saida[t] = c.execute(f'delete from "{t}" where "{tempo}" < ?' + (f" and {FILTRO_EXPURGO[t]}" if t in FILTRO_EXPURGO else ""),
                                      (corte,)).rowcount
     return saida
@@ -4098,7 +4170,37 @@ def esquecer_cliente(conv):
     # _ULT_MSG fica: guarda só o id da última msg, e sem ele o vigia puxaria o histórico do Evo de volta para msgs na hora.
     FEED[:] = [x for x in FEED if x["id"] != conv]
     EVENTOS[:] = [e for e in EVENTOS if e[1] != conv]
+    apagar_nota_obsidian(conv)
     return {t: n for t, n in saida.items() if n}
+
+
+def _teste_backup():
+    g = globals()
+    C = "e1111111-1111-1111-1111-111111111111"
+    paginas = {None: [{"id": 5, "tipo": "incoming", "nome": "Cli", "ts": 50, "texto": "oi", "privada": False}],
+               "5": [{"id": 3, "tipo": "outgoing", "nome": "Sup", "ts": 30, "texto": "a", "privada": True},
+                     {"id": 4, "tipo": "incoming", "nome": "Cli", "ts": 40, "texto": "b", "privada": False}],
+               "3": [{"id": 3, "tipo": "outgoing", "nome": "Sup", "ts": 30, "texto": "a", "privada": True}]}  # repete: para
+    h0, g["evo_historico"] = g["evo_historico"], lambda conv, antes_de=None: [dict(m) for m in paginas.get(antes_de, [])]
+    b0, g["evo_buscar"] = g["evo_buscar"], lambda status="all", page=1: ([{"id": C, "contact": {"name": "G"}}], 1) if page == 1 else ([], 1)
+    try:
+        assert importar_tudo() == {C: ("G", 3, 3)}
+        assert importar_conversa(C, "G") == (3, 0)  # rodar de novo não duplica
+    finally:
+        g["evo_historico"], g["evo_buscar"] = h0, b0
+    m = mensagens_de(C)
+    assert [x["id"] for x in m] == ["3", "4", "5"] and m[0]["privada"] and m[2]["texto"] == "oi"
+    expurgar(1)  # ts de 1970: retenção não toca o backup
+    assert len(mensagens_de(C)) == 3
+    salvar_mensagens(C, "G", [{"id": 5, "tipo": "incoming", "nome": "Cli", "ts": 50, "texto": "oi editado", "apagada": False}])
+    assert mensagens_de(C)[2]["texto"] == "oi editado"
+    salvar_mensagens(C, "G", [{"id": 1, "tipo": "incoming", "nome": "Cli", "ts": 10, "texto": "mais antiga"},
+                              {"id": 2, "tipo": "outgoing", "nome": "Sup", "ts": 20, "texto": "resposta antiga"}])
+    importar_casos(C)
+    n = importar_casos(C)  # rodar de novo, ou com histórico mais antigo, não duplica
+    with db() as c:
+        assert n == 0 and c.execute("select count(*) from casos where conversa=?", (C,)).fetchone()[0] == 1
+    esquecer_cliente(C)
 
 
 def _teste_retencao():
@@ -4166,6 +4268,417 @@ def _teste_retencao():
             esquecer_cliente(x)
 
 
+# ---------- memória pelo backup local e nota no Obsidian ----------
+VAULT_PADRAO = str(Path.home() / "Obsidian" / "Tamino")
+
+
+def _mesclar_memoria(conv, mem, novas, final=False):
+    """Uma chamada de IA: memória atual + mensagens novas (cruas, no formato de evo_historico/mensagens_de) -> memória nova.
+    True se gravou (ou se não havia o que resumir); False se a IA não devolveu JSON válido: a memória fica como está."""
+    ate = str(novas[-1]["id"]) if novas else mem["ate_msg"]
+    novas = [m for m in novas if m["texto"] and m["tipo"] in ("incoming", "outgoing") and not m.get("privada")]  # nota interna não vira memória
+    if not novas and not final:
+        mem_gravar(conv, ate_msg=ate)  # só nota interna/anexo: avança sem gastar IA
+        return True
+    rotulos = {}
+    for m in novas:
+        if m["tipo"] == "incoming" and m["nome"] not in rotulos:
+            rotulos[m["nome"]] = "CLIENTE " + chr(65 + len(rotulos) % 26)
+    def linha(m):
+        t = uma_linha(m["texto"])
+        for n, r in rotulos.items():
+            t = t.replace(n, r) if len(n) >= 3 else t
+        return f"{rotulos.get(m['nome'], 'CLIENTE') if m['tipo'] == 'incoming' else 'SUPORTE'}: {sem_tag(mascarar(t))[:500]}"
+    atual = json.dumps({k: mem[k] for k in ("resumo", "pendencias", "fatos")}, ensure_ascii=False)
+    pedido = (f"<memoria_atual>\n{sem_tag(atual)}\n</memoria_atual>\n<mensagens_novas>\n"
+              + "\n".join(linha(m) for m in novas) + "\n</mensagens_novas>\n"
+              + ("A conversa foi concluída: esvazie as pendências resolvidas.\n" if final else "") + "Devolva o JSON.")
+    out = ia(pedido, SISTEMA_MEMORIA, tipo="memoria", conv=conv) or ""
+    try:
+        d = json.loads(out[out.find("{"):out.rfind("}") + 1])
+        ok = isinstance(d, dict) and isinstance(d.get("resumo"), str) and all(isinstance(d.get(k), list) for k in MEM_LISTAS)
+    except ValueError:
+        ok = False
+    if not ok:
+        mem_gravar(conv)  # JSON inválido: mantém a memória e não repete a cada varredura
+        return False
+    mem_gravar(conv, resumo=d["resumo"], pendencias=d["pendencias"], fatos=d["fatos"], ate_msg=ate)
+    return True
+
+
+def _mesclar_em_blocos(conv, novas, bloco=40, final=False):
+    """_mesclar_memoria por blocos (1 chamada de IA cada, cada um parte da memória gravada pelo anterior).
+    Para no 1º bloco que a IA não devolver: a próxima execução retoma dali. Devolve quantos blocos avançaram."""
+    n = 0
+    for i in range(0, len(novas) or int(final), bloco):
+        if not _mesclar_memoria(conv, mem_ler(conv), novas[i:i + bloco], final and i + bloco >= len(novas)):
+            break
+        n += 1
+    return n
+
+
+def memoria_do_backup(conv, bloco=40):
+    """Memória a partir do histórico INTEIRO salvo (mensagens_de), desde ate_msg, em blocos. Em dia = nada a fazer.
+    Nunca lança; devolve o nº de blocos processados."""
+    try:
+        with db() as c:
+            nome = c.execute("select max(nome_conv) from mensagens where conversa=?", (conv,)).fetchone()[0] or ""
+        if sem_memoria(conv) or eh_n2(nome):
+            return 0
+        salvas, mem = mensagens_de(conv), mem_ler(conv)
+        ids = [str(m["id"]) for m in salvas]
+        if mem["ate_msg"] and mem["ate_msg"] not in ids:  # recomeçar do zero por cima da memória ressuscitaria pendências velhas
+            log(f"[memoria] {conv[:8]}: ate_msg fora do backup, pulei")
+            return 0
+        return _mesclar_em_blocos(conv, salvas[ids.index(mem["ate_msg"]) + 1:] if mem["ate_msg"] else salvas, bloco)
+    except Exception as e:
+        log(f"[memoria] {str(conv)[:8]}: {e}")
+        return 0
+
+
+def _vault():
+    """Pasta do vault do Obsidian (🔧); vazio = desligado."""
+    v = cfg("vault_obsidian", VAULT_PADRAO).strip()
+    return Path(v).expanduser() if v else None
+
+
+def _notas_de(vault, conv):
+    """A nota da conversa pelo sufixo "(<conv[:8]>).md": acha mesmo que o grupo tenha mudado de nome."""
+    return [p for p in (vault / "Conversas").glob("*.md") if p.name.endswith(f" ({conv[:8]}).md")]
+
+
+def _gravar_atomico(p, texto):
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(f"{p.name}.{secrets.token_hex(4)}.tmp")
+    try:
+        tmp.write_text(texto, encoding="utf-8")
+        tmp.replace(p)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _indice_obsidian(vault):
+    """Nota índice com link para cada nota da pasta Conversas; barata, então é regravada a cada exportação."""
+    notas = sorted(p.stem for p in (vault / "Conversas").glob("*.md"))
+    _gravar_atomico(vault / "Tamino - Conversas.md", "# Tamino - Conversas\n\n" + "".join(f"- [[{n}]]\n" for n in notas))
+
+
+def exportar_obsidian(conv):
+    """Memória da conversa como nota Markdown no vault. Nunca lança: o vault é conveniência e não pode quebrar a gravação da memória."""
+    try:
+        vault = _vault()
+        if not vault:
+            return
+        m = mem_ler(conv)
+        with db() as c:
+            salvo = c.execute("select max(nome_conv) from mensagens where conversa=?", (conv,)).fetchone()[0]
+        nome = mascarar(next((f["nome"] for f in FEED if f["id"] == conv), "") or salvo or "")
+        limpo = " ".join(re.sub(r'[\\/:*?"<>|#^\[\]]', " ", nome).split()).strip(".")[:80] or "conversa"  # caracteres que o Obsidian/SO não aceitam em nome
+        arq = vault / "Conversas" / f"{limpo} ({conv[:8]}).md"
+        quando = datetime.fromtimestamp(m["atualizado"] or time.time(), TZ).isoformat(timespec="seconds")
+        lista = lambda itens, marca: "".join(f"{marca}{' '.join(i.split())}\n" for i in itens)
+        _gravar_atomico(arq, f"---\nconversa: {conv}\ngrupo: {json.dumps(nome, ensure_ascii=False)}\natualizado: {quando}\ntags: [tamino, memoria]\n---\n\n"
+                             f"## Resumo\n\n{m['resumo']}\n\n## Pendências\n\n{lista(m['pendencias'], '- [ ] ')}\n"
+                             f"## Fatos\n\n{lista(m['fatos'], '- ')}\n## Fixo (anotado pelo atendente)\n\n{m['fixo']}\n")
+        for p in _notas_de(vault, conv):
+            if p != arq:
+                p.unlink()  # o grupo mudou de nome: sobra a nota antiga
+        _indice_obsidian(vault)
+    except Exception as e:
+        log(f"[obsidian] {str(conv)[:8]}: {e}")
+
+
+def apagar_nota_obsidian(conv):
+    """Remove a nota da conversa e atualiza o índice. Nunca lança."""
+    try:
+        vault = _vault()
+        if vault and (vault / "Conversas").is_dir():
+            for p in _notas_de(vault, conv):
+                p.unlink()
+            _indice_obsidian(vault)
+    except Exception as e:
+        log(f"[obsidian] {str(conv)[:8]}: {e}")
+
+
+def _teste_memoria_backup():
+    import shutil
+    import tempfile
+    g = globals()
+    C, D, E, F, G = (f"{i}2222222-2222-2222-2222-222222222222" for i in "abcdf")
+    t0 = time.time() - 9999
+    mk = lambda n, ini=0, p="m": [{"id": f"{p}{i:03d}", "tipo": "incoming" if i % 2 == 0 else "outgoing", "nome": "Ana", "ts": t0 + i, "autor_id": "",
+                            "texto": f"msg {i}", "privada": False, "reply": None} for i in range(ini, ini + n)]
+    PED, RESP = [], [None]
+    def ia_falsa(pedido, sistema, **_):
+        PED.append(pedido)
+        return RESP[0] if RESP[0] is not None else json.dumps({"resumo": f"bloco {len(PED)}", "pendencias": ["confirmar prazo"], "fatos": ["usa API"]})
+    vault, ia0, hist0, v0, feed0 = Path(tempfile.mkdtemp()), g["ia"], g["evo_historico"], cfg("vault_obsidian", ""), FEED[:]
+    g["ia"] = ia_falsa
+    cfg_salvar(vault_obsidian=str(vault))  # antes de qualquer mem_gravar: o teste nunca escreve no vault real
+    try:
+        # 85 mensagens (uma é nota privada) = ceil(85/40) = 3 blocos, um pedido de IA por bloco, cada um parte da memória anterior
+        msgs = mk(85)
+        msgs[3].update(texto="NOTA_PRIVADA_SECRETA", privada=True)
+        salvar_mensagens(C, "Cliente X", msgs)
+        assert memoria_do_backup(C) == 3 and len(PED) == 3, PED
+        m = mem_ler(C)
+        assert m["ate_msg"] == "m084" and m["resumo"] == "bloco 3" and m["pendencias"] == ["confirmar prazo"], m
+        assert "NOTA_PRIVADA_SECRETA" not in "".join(PED) and "msg 40" not in PED[0] and "msg 40" in PED[1] and "bloco 1" in PED[1]
+        # em dia: nem chama a IA; mensagem nova: só ela entra
+        assert memoria_do_backup(C) == 0 and len(PED) == 3
+        salvar_mensagens(C, "Cliente X", [dict(msgs[0], id="m085", texto="msg nova", ts=time.time())])
+        assert memoria_do_backup(C) == 1 and len(PED) == 4 and "msg nova" in PED[3] and "msg 84" not in PED[3] and mem_ler(C)["ate_msg"] == "m085"
+        # nota no vault: frontmatter, seções, índice, sem sobra de .tmp
+        nota = vault / "Conversas" / f"Cliente X ({C[:8]}).md"
+        t = nota.read_text(encoding="utf-8")
+        for s in (f"---\nconversa: {C}\n", 'grupo: "Cliente X"', "tags: [tamino, memoria]", "## Resumo\n\nbloco 4", "## Pendências\n\n- [ ] confirmar prazo",
+                  "## Fatos\n\n- usa API", "## Fixo (anotado pelo atendente)"):
+            assert s in t, (s, t)
+        indice = vault / "Tamino - Conversas.md"
+        assert f"[[Cliente X ({C[:8]})]]" in indice.read_text(encoding="utf-8") and not list(vault.rglob("*.tmp"))
+        mem_gravar(C, fixo="não ligar à noite")
+        assert "não ligar à noite" in nota.read_text(encoding="utf-8")
+        nota.write_text("x", encoding="utf-8")  # carimbo e ate_msg não regravam a nota
+        mem_gravar(C)
+        mem_gravar(C, ate_msg="m085")
+        assert nota.read_text(encoding="utf-8") == "x"
+        # grupo renomeado: fica uma nota só
+        FEED.append({"id": C, "nome": "Outro: Nome"})
+        mem_gravar(C, resumo="b")
+        assert [p.name for p in (vault / "Conversas").glob("*.md")] == [f"Outro Nome ({C[:8]}).md"]
+        FEED[:] = feed0
+        mem_limpar(C)
+        assert not list((vault / "Conversas").glob("*.md")) and f"({C[:8]})" not in indice.read_text(encoding="utf-8")
+        # IA sem JSON: não avança; a próxima execução refaz o mesmo bloco
+        salvar_mensagens(D, "Cliente Y", mk(3, p="d"))
+        RESP[0] = "lixo"
+        assert memoria_do_backup(D) == 0 and mem_ler(D)["ate_msg"] is None and len(PED) == 5
+        RESP[0] = None
+        assert memoria_do_backup(D) == 1 and mem_ler(D)["ate_msg"] == "d002" and len(PED) == 6
+        # grupo N2 nunca ganha memória (o nome vem do backup)
+        salvar_mensagens(E, cfg("grupo_n2", "Time de Suporte TAMINO"), mk(3, p="e"))
+        assert memoria_do_backup(E) == 0 and len(PED) == 6 and mem_ler(E)["atualizado"] is None
+        # atualizar_memoria: ate_msg fora das 20 últimas do Evo (m025..m044) -> o que falta vem do backup
+        salvar_mensagens(F, "Cliente Z", mk(45, p="f"))
+        mem_gravar(F, ate_msg="f010")
+        g["evo_historico"] = lambda conv, antes_de=None: mk(20, 25, p="f")
+        assert atualizar_memoria(F, forcar=True) and len(PED) == 7
+        assert "msg 11" in PED[6] and "msg 10" not in PED[6] and "msg 44" in PED[6] and mem_ler(F)["ate_msg"] == "f044"
+        # esquecer_cliente apaga a nota
+        mem_gravar(G, resumo="x")
+        nota_g = vault / "Conversas" / f"conversa ({G[:8]}).md"
+        assert nota_g.exists()
+        esquecer_cliente(G)
+        assert not nota_g.exists()
+        # vault vazio desliga: nada é criado
+        cfg_salvar(vault_obsidian="")
+        antes = sorted(p.name for p in vault.rglob("*"))
+        mem_gravar(C, resumo="sem vault")
+        assert _vault() is None and sorted(p.name for p in vault.rglob("*")) == antes
+    finally:
+        g.update(ia=ia0, evo_historico=hist0)
+        cfg_salvar(vault_obsidian=v0)
+        FEED[:] = feed0
+        shutil.rmtree(vault, ignore_errors=True)
+        for x in (C, D, E, F, G):
+            esquecer_cliente(x)
+
+
+# ---------- treinamento: casos do histórico e escolha A/B ----------
+VARIANTES = {"info": "A", "info_b": "B", "generico": "generico"}  # versão oferecida -> nome gravado em escolhas/casos
+
+
+def _junta(textos):
+    """Mensagens de um bloco em uma linha só, mascaradas (é o que vai para a tabela casos)."""
+    return " ⏎ ".join(mascarar(uma_linha(t)) for t in textos)
+
+
+def importar_casos(conv=None):
+    """Segmenta o backup local (tabela mensagens) em casos: bloco contíguo do cliente = pergunta, bloco contíguo seguinte
+    do suporte = resposta. Ignora nota privada, o que não é incoming/outgoing, o grupo N2 e conversas ignoradas.
+    Reconstrói os casos importados de cada conversa lida (histórico mais antigo ou resposta que cresceu não duplicam).
+    Devolve o saldo de casos (novos - sumidos)."""
+    import itertools
+    with db() as c:
+        rows = c.execute("""select conversa, nome_conv, tipo, autor, texto, id, ts from mensagens
+                            where tipo in ('incoming','outgoing') and privada=0 and trim(coalesce(texto,'')) != ''
+                            and (?1 is null or conversa=?1) order by conversa, ts, rowid""", (conv,)).fetchall()
+    casos, lidas, ign = [], set(), ignorados()
+    for cv, grupo in itertools.groupby(rows, key=lambda r: r[0]):
+        ms = list(grupo)
+        nome = next((r[1] for r in ms if r[1]), "")
+        lidas.add(cv)
+        if eh_n2(nome) or cv in ign:
+            continue
+        blocos = [list(b) for _, b in itertools.groupby(ms, key=lambda r: r[2])]  # lados se alternam: pergunta, resposta, pergunta...
+        for perg, resp in zip(blocos, blocos[1:]):
+            textos = [r[4] for r in resp]
+            if perg[0][2] != "incoming" or all(t.strip() == MSG_ESPERA or not re.search(r"\w", t) for t in textos):  # só espera ou só emoji
+                continue
+            casos.append((cv, nome, perg[0][5], _junta([r[4] for r in perg]), _junta(textos),
+                          ", ".join(dict.fromkeys(r[3] for r in resp if r[3])), ids_curtos("\n".join(r[4] for r in perg)),
+                          "importado", resp[-1][6]))
+    with db() as c:  # uma transação: apaga e regrava os importados das conversas lidas
+        antes = c.execute("select count(*) from casos where origem='importado'").fetchone()[0]
+        c.executemany("delete from casos where origem='importado' and conversa=?", [(cv,) for cv in lidas])
+        c.executemany("insert or ignore into casos(conversa,nome_conv,msg_pergunta,pergunta,resposta,autor,ids,origem,ts) values(?,?,?,?,?,?,?,?,?)", casos)
+        return c.execute("select count(*) from casos where origem='importado'").fetchone()[0] - antes
+
+
+def ids_curtos(t):
+    """IDs da pergunta só pelos 8 primeiros caracteres: chave Pix aleatória inteira não fica na base de treino."""
+    return json.dumps([i[:8] for i in extrair_ids(t)])
+
+
+def variante_escolhida(texto, versoes):
+    """(variante, editado): a versão oferecida mais parecida com o texto enviado; abaixo de 0,5 de semelhança = manual.
+    editado = 1 - semelhança (0 = enviou como veio). Sem versões: ("manual", None)."""
+    import difflib
+    texto = (texto or "")[:4000]  # SequenceMatcher é quadrático: texto enorme travaria o pedido
+    def nota(v):
+        sm = difflib.SequenceMatcher(None, texto, v[:4000], autojunk=False)
+        return sum(b.size for b in sm.get_matching_blocks()) / max(len(v[:4000]), 1), sm.ratio()  # quanto da versão sobreviveu
+    sim = [(*nota(versoes[k]), k) for k in VARIANTES if versoes.get(k)]
+    if not sim:
+        return "manual", None
+    f, r, k = max(sim, key=lambda x: x[1])  # empate fica com a primeira (A)
+    if r < 0.5:  # versão quase inteira dentro do texto + acréscimo não vira "manual"
+        f, r, k = max(sim, key=lambda x: x[0])
+        if f < 0.9:
+            return "manual", 1 - max(x[1] for x in sim)
+    return VARIANTES[k], 1 - r
+
+
+def registrar_escolha(rid, texto=None):
+    """Guarda o que o atendente fez com o card: texto = o que disparou (grava a variante e o caso) ou None = descartou.
+    Quem chama usa sem_falhar: o envio já saiu e o registro não pode derrubá-lo."""
+    rid = int(rid)
+    with db() as c:
+        r = c.execute("select conversa, nome, detalhes from rascunhos where id=?", (rid,)).fetchone()
+    if not r:
+        return
+    conv, nome, det = r[0], r[1], det_json(r[2])
+    versoes = {k: v for k, v in (det.get("versoes") or {}).items() if v}
+    variante, editado = ("descartado", None) if texto is None else variante_escolhida(texto, versoes)
+    caso = None
+    if texto is not None:
+        # a pergunta é o que o cliente disse depois da nossa última resposta; card antigo sem contexto usa o backup local
+        msgs = [m for m in det.get("contexto") or mensagens_de(conv) if m["tipo"] in ("incoming", "outgoing") and not m.get("privada") and m["texto"]]
+        while msgs and msgs[-1]["tipo"] == "outgoing":  # card refeito depois de uma resposta nossa (espera, N2): a pergunta é a anterior
+            msgs.pop()
+        ult = max((i for i, m in enumerate(msgs) if m["tipo"] == "outgoing"), default=-1)
+        perg = [m["texto"] for m in msgs[ult + 1:] if m["tipo"] == "incoming"]
+        caso = (conv, nome, str(rid), _junta(perg), _junta([texto]), cfg("nome_atendente", "Samuel"),
+                ids_curtos("\n".join(perg)), "painel", variante, editado, time.time())
+    with db() as c:
+        c.execute("insert or ignore into escolhas values(?,?,?,?,?,?)",
+                  (rid, conv, time.time(), variante, editado, json.dumps({k: mascarar(v) for k, v in versoes.items()}, ensure_ascii=False)))
+        if caso:
+            c.execute("insert or ignore into casos(conversa,nome_conv,msg_pergunta,pergunta,resposta,autor,ids,origem,variante,editado,ts) "
+                      "values(?,?,?,?,?,?,?,?,?,?,?)", caso)
+
+
+def metricas_treino():
+    """([(autor, casos importados)], {variante: (escolhas, edição média ou None)}): Insights e o modo `casos`."""
+    with db() as c:
+        autores = c.execute("select coalesce(nullif(autor,''),'?'), count(*) from casos where origem='importado' group by 1 order by 2 desc, 1").fetchall()
+        esc = {v: (n, m) for v, n, m in c.execute("select variante, count(*), avg(editado) from escolhas group by variante")}
+    return autores, esc
+
+
+def treino_html():
+    autores, esc = metricas_treino()
+    rot = {"A": "🅰 Informativo A", "B": "🅱 Informativo B", "generico": "⏳ Genérico", "manual": "✍️ Manual (nenhuma serviu)", "descartado": "🗑 Descartado"}
+    linhas = [[r, esc.get(k, (0, None))[0], "—" if esc.get(k, (0, None))[1] is None else f"{100 * esc[k][1]:.0f}%"] for k, r in rot.items()]
+    return ("<div class=card><h3>🎓 Treinamento da IA</h3>"
+            + tabela(["Casos do histórico, por quem respondeu", "Casos"], [[html.escape(a), n] for a, n in autores])
+            + tabela(["Rascunhos", "Escolhas", "Edição média"], linhas)
+            + "<p class=meta>Edição média = quanto o texto enviado mudou em relação à versão escolhida (0% = enviou como veio).</p></div>")
+
+
+def _teste_ab():
+    g = globals()
+    CA, CB, CN = (f"{i}b111111-1111-1111-1111-111111111111" for i in "abc")
+    UID = "6979f536-9a24-4feb-b902-e9522c025010"
+    # importar_casos: privada, espera, emoji, N2 e quebra de linha; idempotente
+    m = lambda i, tipo, quem, texto, privada=False: {"id": f"ab-{i}", "tipo": tipo, "nome": quem, "ts": i, "texto": texto, "privada": privada}
+    salvar_mensagens(CA, "Cliente AB", [
+        m(1, "incoming", "Cli", "oi, meu saque não caiu"), m(2, "incoming", "Cli", "outro"), m(3, "outgoing", "Samuel", MSG_ESPERA),
+        m(4, "incoming", "Cli", f"e aí?\nid {UID} cpf 123.456.789-09 ana@x.com"), m(5, "outgoing", "Samuel", "NOTA SECRETA", True),
+        m(6, "outgoing", "Samuel", "Tá pago sim"), m(7, "outgoing", "J.L", "qualquer coisa chama"), m(8, "incoming", "Cli", "valeu"),
+        m(9, "outgoing", "Daniel", "👍"), m(10, "incoming", "Cli", "outra dúvida"), m(11, "outgoing", "Daniel", "Claro, me manda"),
+        m(12, "incoming", "Cli", "obrigado"), m(13, "activity", "", "atividade")])
+    salvar_mensagens(CN, "Time de Suporte TAMINO", [m(21, "incoming", "J.L", "pergunta"), m(22, "outgoing", "Samuel", "resposta")])
+    try:
+        assert importar_casos(CA) == 2 and importar_casos(CA) == 0
+        importar_casos()  # todas as conversas: não duplica as de cima e o grupo N2 continua de fora
+        with db() as c:
+            rows = c.execute("select pergunta, resposta, autor, ids, origem, msg_pergunta, variante from casos where conversa in (?,?) order by id", (CA, CN)).fetchall()
+        assert [(p, r, a, json.loads(i), o, mp, v) for p, r, a, i, o, mp, v in rows] == [
+            ("e aí? ⏎ id 6979f536… cpf [CPF] [EMAIL]", "Tá pago sim ⏎ qualquer coisa chama", "Samuel, J.L", [UID[:8]], "importado", "ab-4", None),
+            ("outra dúvida", "Claro, me manda", "Daniel", [], "importado", "ab-10", None)], rows
+        # qual versão foi escolhida
+        vs = {"info": "O saque de 8a1c03b5 foi pago, R$ 20,00.", "info_b": "Pago, 8a1c03b5, R$ 20,00.", "generico": "Só um instante, estamos verificando."}
+        assert variante_escolhida(vs["info"], vs) == ("A", 0) and variante_escolhida(vs["info_b"], vs) == ("B", 0)
+        assert variante_escolhida(vs["generico"], vs)[0] == "generico" and variante_escolhida("zzzz qqqq kkkk wwww", vs)[0] == "manual"
+        v, e = variante_escolhida(vs["info_b"] + " Obrigado!", vs)
+        assert v == "B" and 0 < e < 0.5, (v, e)
+        assert variante_escolhida("x", {}) == ("manual", None) and variante_escolhida("x", {"info": ""}) == ("manual", None)
+        # preparar_resposta gera a B; o marcador de escalação só vale da A; sem B não há alerta; sigilo também na B
+        RESP = {"info": "texto A informativo.", "info_b": "texto B curto.\n[[N2:missing_knowledge]] não vale", "generico": "Só um instante."}
+        def backend(modelo, pedido, sistema=None, limpar=True, **_):
+            return RESP["info_b" if MODOS["info_b"] in pedido else "generico" if MODOS["generico"] in pedido else "info"]
+        orig = {k: g[k] for k in ("_redigir_claude_code", "_redigir_api", "tamino_lookup")}
+        g.update(_redigir_claude_code=backend, _redigir_api=backend, tamino_lookup=lambda i: {"hits": []})
+        h = lambda i, tipo, t: {"id": f"ab-h{i}", "tipo": tipo, "nome": "Ana", "texto": t, "hora": "", "ts": i, "reply": None, "anexos": []}
+        hist = [h(1, "incoming", "meu saque não caiu"), h(2, "outgoing", "já vejo aqui"), h(3, "incoming", "e aí? cpf 123.456.789-09"), h(4, "incoming", f"id {UID}")]
+        try:
+            r1 = preparar_resposta(CB, ids=[UID], nome="Cliente AB", historico=hist)
+            RESP["info_b"] = None
+            r2 = preparar_resposta(CB, ids=[UID], nome="Cliente AB", historico=hist)
+            RESP["info_b"] = "Foi na GOWD."
+            r3 = preparar_resposta(CB, ids=[UID], nome="Cliente AB", historico=hist)
+        finally:
+            g.update(orig)
+        with db() as c:
+            det = {k: c.execute("select detalhes from rascunhos where id=?", (r["rascunho_id"],)).fetchone()[0] for k, r in (("1", r1), ("2", r2), ("3", r3))}
+        d1, d2, d3 = (json.loads(det[k]) for k in "123")
+        assert r1["texto"] == "texto A informativo." and r1["escalada"] is None and "[[N2" not in det["1"]
+        assert list(d1["versoes"]) == ["info", "info_b", "generico"] and d1["versoes"]["info_b"] == "texto B curto." and not d1["sigilo"]
+        assert list(d2["versoes"]) == ["info", "generico"] and "IA falhou" not in (r2["alerta"] or "")
+        assert "viola sigilo (info_b)" in r3["alerta"] and list(d3["sigilo"]) == ["info_b"]
+        # card novo mostra A, B e genérico; card antigo (sem B) continua funcionando
+        hh = versoes_html(r1["rascunho_id"], det["1"], r1["texto"])
+        assert "🅰 Informativo A" in hh and "🅱 Informativo B" in hh and "⏳ Genérico" in hh
+        assert "viola sigilo" in versoes_html(r3["rascunho_id"], det["3"], r3["texto"])
+        velho = versoes_html(1, json.dumps({"versoes": {"info": "a", "generico": "g"}}), "a")
+        assert "🅰 Informativo A" in velho and "⏳ Genérico" in velho and "🅱" not in velho and "<div class=lbls>" in versoes_html(1, None, "")
+        # registro: enviou a B com pequena edição / descartou / escreveu à mão / card sem contexto (usa o backup local)
+        registrar_escolha(r1["rascunho_id"], "texto B curto. Obrigado!")
+        registrar_escolha(r1["rascunho_id"], "texto B curto. Obrigado!")  # clique repetido não duplica
+        registrar_escolha(r2["rascunho_id"], None)
+        registrar_escolha(str(r3["rascunho_id"]), "zzzz qqqq kkkk wwww")
+        rid4 = enfileirar(CA, "Disponha", {"versoes": {"info": "Disponha"}}, None)
+        registrar_escolha(rid4, "Disponha")
+        with db() as c:
+            casos = c.execute("select msg_pergunta, pergunta, resposta, autor, variante, editado from casos where origem='painel' order by id").fetchall()
+            esc = c.execute("select rascunho_id, variante, editado, versoes from escolhas order by rascunho_id").fetchall()
+        assert len(casos) == 3 and len(esc) == 4, (casos, esc)
+        assert casos[0][:5] == (str(r1["rascunho_id"]), "e aí? cpf [CPF] ⏎ id 6979f536…", "texto B curto. Obrigado!", "Samuel", "B") and 0 < casos[0][5] < 0.5
+        assert casos[1][4] == "manual" and casos[1][5] > 0.5 and casos[2][1:] == ("obrigado", "Disponha", "Samuel", "A", 0)
+        assert [x[1] for x in esc] == ["B", "descartado", "manual", "A"] and esc[1][2] is None
+        assert json.loads(esc[1][3]) == {"info": "texto A informativo.", "generico": "Só um instante."}
+        # métricas e a seção da página
+        autores, por = metricas_treino()
+        assert dict(autores)["Samuel, J.L"] >= 1 and dict(autores)["Daniel"] >= 1 and por["B"][0] == 1 and por["descartado"] == (1, None)
+        ht = treino_html()
+        assert "Samuel, J.L" in ht and "Informativo B" in ht and "Descartado" in ht
+    finally:
+        for x in (CA, CB, CN):
+            esquecer_cliente(x)
+
+
 def teste():
     """Self-check em banco temporário, sem rede e sem IA: tudo que sai da máquina é trocado por função falsa."""
     import tempfile
@@ -4177,13 +4690,17 @@ def teste():
     feed0, ev0 = FEED[:], EVENTOS[:]
     nada = lambda *a, **k: (_ for _ in ()).throw(AssertionError(f"rede/IA chamada no teste: {a[:1]}"))
     g.update(tamino_lookup=nada, evo_enviar=nada, evo_historico=nada, _redigir_api=nada, _redigir_claude_code=nada, ia=nada)
+    cfg_salvar(vault_obsidian="")  # vazio desliga: nenhum teste escreve no vault real do Obsidian
     try:
         txt = _teste_base()
         _teste_n2_memoria()
+        _teste_memoria_backup()
+        _teste_ab()
         _teste_ia_core(orig)
         _teste_sigilo()
         _teste_classifica()
         _teste_retencao()
+        _teste_backup()
     finally:
         g.update(orig)
         os.environ.update(env0)
@@ -4338,10 +4855,12 @@ def _teste_n2_memoria():
     assert mem_ler("nada") == {"resumo": "", "pendencias": [], "fatos": [], "fixo": "", "ate_msg": None, "atualizado": None}
     mem_limpar(C1)
     assert mem_ler(C1)["atualizado"] is None
-    # B3 atualização: desligada por padrão; JSON válido grava; lixo mantém; pedido sem e-mail nem nome
+    # B3 atualização: ligada por padrão, desligável; JSON válido grava; lixo mantém; pedido sem e-mail nem nome
+    assert cfg("memoria_auto", "1") == "1"
     PIA, RIA = [], ['{"resumo": "pediu o prazo do MED", "pendencias": ["confirmar prazo"], "fatos": ["usa API"]}']
     g["ia"] = lambda pedido, sistema, **_: (PIA.append(pedido), RIA[0])[1]
     HIST[C1] = [msg("c1", "incoming", "oi, aqui é a Ana, ana@x.com"), msg("c2", "outgoing", "Oi!", "eu")]
+    cfg_salvar(memoria_auto="0")
     assert atualizar_memoria(C1) is False and not PIA
     assert atualizar_memoria(C1, forcar=True) and mem_ler(C1)["resumo"] == "pediu o prazo do MED" and mem_ler(C1)["ate_msg"] == "c2"
     assert "ana@x.com" not in PIA[-1] and "Ana" not in PIA[-1] and "CLIENTE A" in PIA[-1], PIA[-1]
@@ -4438,6 +4957,24 @@ if __name__ == "__main__":
         ThreadingHTTPServer(("127.0.0.1", 8765), Painel).serve_forever()
     elif modo == "teste":
         teste()
+    elif modo == "importar":  # backup de todas as conversas do Evo no fila.db (só leitura no Evo)
+        r = importar_tudo()
+        for conv, (nome, lidas, novas) in r.items():
+            print(f"{conv[:8]} {nome[:30]:30} {lidas:5} lidas {novas:5} novas")
+        print(f"{len(r)} conversas, {sum(x[2] for x in r.values())} mensagens novas")
+    elif modo == "memorias":  # memória de todas as conversas do backup local; retomável (só faz o que falta); usa IA, não o Evo
+        with db() as c:
+            convs = c.execute("select conversa, max(nome_conv), max(ts) t from mensagens group by conversa order by t desc").fetchall()
+        for i, (conv, nome, _) in enumerate(convs, 1):
+            print(f"[{i}/{len(convs)}] {conv[:8]} {(nome or '')[:30]:30} {memoria_do_backup(conv)} bloco(s)", flush=True)
+        print(f"{len(convs)} conversas")
+    elif modo == "casos":  # segmenta o backup local em casos pergunta/resposta (rode `importar` antes)
+        importar_casos()
+        with db() as c:
+            n = c.execute("select count(*) from casos where origem='importado'").fetchone()[0]
+        print(f"{n} casos do histórico")
+        for quem, n in metricas_treino()[0]:
+            print(f"{n:6} {quem}")
     elif modo == "checar":  # testa os tokens do .env (só leitura)
         for nome, f in [("Tamino", lambda: tamino_lookup("00000000-0000-0000-0000-000000000000")),
                         ("Evo", lambda: com_renovacao(lambda: http_json("GET", EVO_API() + "/conversations?page=1", evo_headers())))]:
