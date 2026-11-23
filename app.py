@@ -545,7 +545,31 @@ def card_imediato(conv, nome, historico):
         r = c.execute("select texto, detalhes from rascunhos where conversa=? and status='pendente' order by id desc limit 1", (conv,)).fetchone()
     det = det_json(r[1]) if r else {}
     det.update(contexto=[m for m in historico[-8:] if m["texto"]], redigindo=True)
-    return enfileirar(conv, r[0] if r else MSG_ESPERA, det, "✍️ A IA está redigindo a resposta…", nome)
+    rid = enfileirar(conv, r[0] if r else MSG_ESPERA, det, "✍️ A IA está redigindo a resposta…", nome)
+    if not r:  # só card novo toca; mensagem nova num card que já está na fila não
+        notificar_bark("Nova mensagem na fila", nome or "Conversa")
+    return rid
+
+
+def notificar_bark(titulo, texto):
+    """Alarme no iPhone pelo app Bark. Liga com BARK_KEY no .env; manda só o nome da conversa, nunca o texto do cliente."""
+    chave = os.environ.get("BARK_KEY", "").strip()
+    if not chave:
+        return False
+    corpo = {"device_key": chave, "title": titulo, "body": texto, "group": "Tamino",
+             "sound": os.environ.get("BARK_SOM", "alarm"),
+             "level": os.environ.get("BARK_NIVEL", "critical"),  # critical toca mesmo no silencioso/foco
+             "volume": 10, "call": os.environ.get("BARK_REPETIR", "1")}  # call=1: repete o toque por 30 s
+
+    def enviar():
+        try:
+            req = urllib.request.Request(os.environ.get("BARK_SERVIDOR", "https://api.day.app").rstrip("/") + "/push",
+                                         json.dumps(corpo).encode(), {"content-type": "application/json"})
+            urllib.request.urlopen(req, timeout=10).read()
+        except Exception as e:
+            log(f"[bark] falhou: {type(e).__name__}")  # sem a mensagem: a URL/corpo carregam a chave
+    threading.Thread(target=enviar, daemon=True).start()
+    return True
 
 
 def enviar_espera(conv):
@@ -5175,6 +5199,15 @@ def treino_html():
 
 def _teste_ab():
     Cx = "f3333333-1111-1111-1111-111111111111"  # um card por conversa: mensagem nova atualiza o pendente, mesmo id
+    g, toques = globals(), []
+    bark0, g["notificar_bark"] = notificar_bark, lambda t, x: toques.append(x)
+    Cb = "f4444444-1111-1111-1111-111111111111"
+    msg = [{"id": "zb", "tipo": "incoming", "nome": "Ana", "texto": "oi", "hora": ""}]
+    card_imediato(Cb, "Grupo B", msg), card_imediato(Cb, "Grupo B", msg)
+    g["notificar_bark"] = bark0
+    assert toques == ["Grupo B"], toques  # Bark só no card novo
+    assert notificar_bark("t", "x") is False  # sem BARK_KEY não sai nada
+    esquecer_cliente(Cb)
     a1 = enfileirar(Cx, "um", {"contexto": []}, None, "G")
     a2 = card_imediato(Cx, "G", [{"id": "z", "tipo": "incoming", "nome": "Ana", "texto": "nova", "hora": ""}])
     with db() as c:
@@ -5445,7 +5478,7 @@ def teste():
     g["DB"] = Path(tempfile.mkdtemp()) / "teste.db"  # antes de qualquer cfg()/db(): nada toca o fila.db real
     cfg_salvar(vault_obsidian=str(g["DB"].parent / "vault"))  # nem o vault real do Obsidian
     raj0, g["RAJADA_S"] = RAJADA_S, 0  # sem espera de rajada no teste
-    env0 = {k: os.environ.pop(k) for k in ("N2_AUTO", "MEMORIA_AUTO", "ANTHROPIC_API_KEY", "CONV_N2", "GRUPO_N2") if k in os.environ}
+    env0 = {k: os.environ.pop(k) for k in ("N2_AUTO", "MEMORIA_AUTO", "ANTHROPIC_API_KEY", "CONV_N2", "GRUPO_N2", "BARK_KEY") if k in os.environ}
     feed0, ev0 = FEED[:], EVENTOS[:]
     nada = lambda *a, **k: (_ for _ in ()).throw(AssertionError(f"rede/IA chamada no teste: {a[:1]}"))
     g.update(tamino_lookup=nada, evo_enviar=nada, evo_historico=nada, _redigir_api=nada, _redigir_claude_code=nada, ia=nada)
@@ -5745,6 +5778,9 @@ if __name__ == "__main__":
         print(f"{n} casos do histórico")
         for quem, n in metricas_treino()[0]:
             print(f"{n:6} {quem}")
+    elif modo == "bark":  # manda um alarme de teste para o iPhone (BARK_KEY no .env)
+        print("enviado, confira o iPhone" if notificar_bark("Teste do painel", "Se tocou, o alarme da fila está ok") else "falta BARK_KEY no .env")
+        time.sleep(5)
     elif modo == "checar":  # testa os tokens do .env (só leitura)
         for nome, f in [("Tamino", lambda: tamino_lookup("00000000-0000-0000-0000-000000000000")),
                         ("Evo", lambda: com_renovacao(lambda: http_json("GET", EVO_API() + "/conversations?page=1", evo_headers())))]:
