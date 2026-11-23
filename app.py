@@ -6,6 +6,7 @@ Uso:
   uv run app.py painel              # painel em http://127.0.0.1:8765
   uv run app.py teste               # self-check
   uv run app.py importar            # backup de todo o histórico do Evo no banco local
+  uv run app.py historico           # conversa inteira de cada grupo como nota no Obsidian
   uv run app.py memorias            # memória de todas as conversas do backup local (retomável; usa IA)
   uv run app.py casos               # segmenta o backup em casos pergunta/resposta (por autor)
 Config: .env ao lado deste arquivo (ver .env.example).
@@ -1241,7 +1242,8 @@ def item_feed(cv):
     return {"id": cv.get("id"), "nome": (cv.get("contact") or {}).get("name") or cv.get("display_id") or "?",
             "quem": autor(m), "texto": texto, "status": cv.get("status"),
             "tipo": m.get("message_type"), "hora": hora[6:] if hora.startswith(datetime.now(TZ).strftime("%d/%m")) else hora,
-            "pendente": int(cv.get("unread_count") or 0)}
+            "pendente": int(cv.get("unread_count") or 0), "grupo": bool(cv.get("is_group")),
+            "foto": (cv.get("contact") or {}).get("thumbnail") or ""}
 
 
 def atualizar_feed(conversas):
@@ -1331,7 +1333,8 @@ def importar_tudo(status="all"):
 
 
 def registrar_msgs(conv, nome, hist):
-    sem_falhar(salvar_mensagens, conv, nome, hist)  # backup contínuo: toda mensagem que o vigia vê fica salva
+    if sem_falhar(salvar_mensagens, conv, nome, hist):  # backup contínuo: toda mensagem que o vigia vê fica salva
+        exportar_historico(conv)
     eu = meu_id()
     with db() as c:
         c.executemany("insert or ignore into msgs values(?,?,?,?,?,?)",
@@ -1522,92 +1525,148 @@ TOKEN = secrets.token_urlsafe(16)  # anti-CSRF: só o painel aberto agora conseg
 RE_CONV = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 CSS = """
-:root{--bg:#111318;--card:#1b1e25;--tx:#e6e6e6;--mut:#8b919c;--ac:#2f7cf6;--warn:#f5a524;--in:#5fd3a4}
-body{background:var(--bg);color:var(--tx);font:15px system-ui;max-width:1100px;margin:24px auto;padding:0 16px}
+:root{color-scheme:light;--card:#f5f5f4;--ring:#6366f1;--input:#d6d3d1;--muted:#e7e5e4;--accent:#f3e5f5;--border:#d6d3d1;--radius:1.25rem;
+--chart-1:#6366f1;--chart-2:#4f46e5;--chart-3:#4338ca;--primary:#6366f1;--secondary:#d6d3d1;--background:#e7e5e4;--foreground:#1e293b;
+--destructive:#ef4444;--muted-foreground:#6b7280;--accent-foreground:#374151;--primary-foreground:#ffffff;--secondary-foreground:#4b5563;
+--font-sans:"Plus Jakarta Sans",system-ui,sans-serif;--font-mono:"Roboto Mono",ui-monospace,monospace;
+--shadow:2px 2px 10px 4px hsl(240 4% 60% / .18);
+--field:#fafaf9;--link:#4f46e5;--in:#047857;--warn:#b45309;--n2:#4f46e5;--ok:#15803d;--ok-bg:#d1fae5;--ok-fg:#065f46;--er-bg:#fee2e2;--er-fg:#b91c1c;
+--bg:var(--background);--tx:var(--foreground);--mut:var(--muted-foreground);--ac:var(--primary)}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){color-scheme:dark;--card:#2c2825;--ring:#818cf8;--input:#3a3633;--muted:#1f1c19;--accent:#484441;
+--border:#3a3633;--chart-1:#818cf8;--chart-2:#6366f1;--chart-3:#4f46e5;--primary:#818cf8;--secondary:#3a3633;--background:#1e1b18;--foreground:#e2e8f0;
+--muted-foreground:#9ca3af;--accent-foreground:#d1d5db;--primary-foreground:#1e1b18;--secondary-foreground:#d1d5db;--shadow:2px 2px 10px 4px hsl(0 0% 0% / .18);
+--field:#1f1c19;--link:#a5b4fc;--in:#5fd3a4;--warn:#f5a524;--n2:#818cf8;--ok:#1f7a52;--ok-bg:#1f4d3d;--ok-fg:#9ff0cf;--er-bg:#5a2323;--er-fg:#ffb4b4}}
+:root[data-theme=dark]{color-scheme:dark;--card:#2c2825;--ring:#818cf8;--input:#3a3633;--muted:#1f1c19;--accent:#484441;
+--border:#3a3633;--chart-1:#818cf8;--chart-2:#6366f1;--chart-3:#4f46e5;--primary:#818cf8;--secondary:#3a3633;--background:#1e1b18;--foreground:#e2e8f0;
+--muted-foreground:#9ca3af;--accent-foreground:#d1d5db;--primary-foreground:#1e1b18;--secondary-foreground:#d1d5db;--shadow:2px 2px 10px 4px hsl(0 0% 0% / .18);
+--field:#1f1c19;--link:#a5b4fc;--in:#5fd3a4;--warn:#f5a524;--n2:#818cf8;--ok:#1f7a52;--ok-bg:#1f4d3d;--ok-fg:#9ff0cf;--er-bg:#5a2323;--er-fg:#ffb4b4}
+::selection{background:color-mix(in srgb,var(--primary) 30%,transparent)} html{scrollbar-color:var(--input) transparent;accent-color:var(--primary)}
+textarea,input{caret-color:var(--primary)} :focus-visible{outline:2px solid var(--ring);outline-offset:2px}
+body{background:var(--bg);color:var(--tx);font:15px/1.5 var(--font-sans);-webkit-font-smoothing:antialiased;max-width:1100px;margin:24px auto;padding:0 16px}
 a{color:inherit;text-decoration:none} a:hover .n{text-decoration:underline}
-.card{background:var(--card);border-radius:10px;padding:16px;margin:0 0 16px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:18px;margin:0 0 16px;box-shadow:var(--shadow)}
 .meta,.vazio{color:var(--mut);font-size:13px} .alerta{color:var(--warn);margin:8px 0}
-textarea{width:100%;box-sizing:border-box;background:#0c0e12;color:var(--tx);border:1px solid #2a2f39;border-radius:8px;padding:10px;font:14px ui-monospace,monospace;margin:8px 0}
-button{background:var(--ac);color:#fff;border:0;border-radius:8px;padding:9px 18px;font-weight:600;cursor:pointer}
+textarea{width:100%;box-sizing:border-box;background:var(--field);color:var(--tx);border:1px solid var(--border);border-radius:8px;padding:10px 12px;font:14px/1.5 var(--font-sans);margin:8px 0}
+button{background:var(--ac);color:var(--primary-foreground);border:0;border-radius:12px;font-family:inherit;padding:9px 18px;font-weight:600;cursor:pointer}
 .sec{background:transparent;color:var(--mut)}
-.conv{background:#0c0e12;border-radius:8px;padding:8px 10px;margin:8px 0;font-size:14px;max-height:55vh;overflow:auto}
-.msg{margin:6px 0;white-space:pre-wrap;word-break:break-word} .msg.in b{color:var(--in)} .msg.out{color:var(--mut)}
-.msg.out b{color:#7fb0ff}
-.msg small{color:var(--mut)}
+.conv{background:var(--muted);border:1px solid var(--border);border-radius:var(--radius);padding:12px 14px;margin:8px 0;font-size:14px;max-height:55vh;overflow:auto}
+.msg{display:flex;align-items:flex-end;gap:8px;margin:10px 0} .msg.out{flex-direction:row-reverse}
+.av{flex:0 0 30px;height:30px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;letter-spacing:.02em;
+color:#fff;background:linear-gradient(135deg,var(--chart-1),var(--chart-3))}
+.bolha{max-width:78%;min-width:0;padding:8px 13px 9px;border-radius:18px;font-size:14px;line-height:1.5;white-space:pre-wrap;word-break:break-word}
+.msg.in .bolha{background:var(--card);border:1px solid var(--border);border-bottom-left-radius:6px;box-shadow:0 4px 12px -4px rgb(0 0 0 / .12)}
+.msg.out .bolha{background:var(--primary);color:var(--primary-foreground);border-bottom-right-radius:6px;box-shadow:0 6px 16px -8px color-mix(in srgb,var(--primary) 45%,transparent)}
+.mh{display:flex;gap:8px;align-items:baseline;font-size:12px;margin:0 0 2px;white-space:normal} .mh b{font-weight:700} .msg.in .mh b{color:var(--in)}
+.mh small{color:var(--muted-foreground);font-variant-numeric:tabular-nums} .msg.out .mh small{color:inherit;opacity:.75}
+.msg.out .bolha a,.msg.out .bolha .arq{color:inherit;text-decoration:underline}
 .grid{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:20px}
 .grid>div{min-width:0}
-.feed{background:var(--card);border-radius:10px;padding:12px;font-size:13px;align-self:start;position:sticky;top:12px;max-height:90vh;overflow:auto}
-.fi{display:block;position:relative;padding-right:34px!important;padding:7px 0;border-bottom:1px solid #2a2f39} .fi:last-child{border:0}
+.feed{background:var(--card);border:1px solid var(--border);box-shadow:var(--shadow);border-radius:var(--radius);padding:12px;font-size:13px;align-self:start;position:sticky;top:12px;max-height:90vh;overflow:auto}
+.fi{display:flex;gap:10px;align-items:flex-start;position:relative;padding-right:34px!important;padding:8px 0;border-bottom:1px solid var(--border)}
+.fc{flex:1;min-width:0}
+.fav{position:relative;flex:0 0 38px;height:38px;border-radius:50%;overflow:hidden;display:flex;align-items:center;justify-content:center;
+font-size:12px;font-weight:700;color:#fff;background:linear-gradient(135deg,var(--chart-1),var(--chart-3))}
+.fav{background:linear-gradient(135deg,hsl(var(--h) 58% 42%),hsl(calc(var(--h) + 40) 58% 32%))} .fav.gr{border-radius:12px}
+.fav img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover} .fi.off .fav{filter:grayscale(1)} .fi:last-child{border:0}
 .fi .t{color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis} .fi.in .n{color:var(--in)}
-.n2{background:#7c5cff;color:#fff;border-radius:9px;padding:0 6px;font-size:11px;margin-left:4px}
-.esc{border-left:3px solid #7c5cff;background:#151a24;padding:6px 10px;margin:8px 0;border-radius:4px}
+.n2{background:var(--n2);color:var(--primary-foreground);border-radius:9px;padding:0 6px;font-size:11px;margin-left:4px}
+.esc{border:1px solid color-mix(in srgb,var(--n2) 40%,transparent);background:color-mix(in srgb,var(--n2) 8%,var(--card));padding:8px 12px;margin:8px 0;border-radius:14px}
 .esc button{padding:6px 12px;font-size:13px;margin:0 6px 4px 0}
-.idi{margin:8px 0 0} .idi select{background:#0c0e12;color:var(--tx);border:1px solid #2a2f39;border-radius:8px;padding:5px 8px;font:inherit}
-.tr{background:transparent;color:#7fb0ff;border:1px solid #3a4253;border-radius:6px;padding:1px 8px;font-size:12px;font-weight:500;margin-left:6px}
-.trad{margin:4px 0 2px 12px;padding:6px 10px;border-left:3px solid #7fb0ff;background:#151a24;color:#dfe6f2;font-size:14px;white-space:pre-wrap}
+.idi{margin:8px 0 0} .idi select{background:var(--field);color:var(--tx);border:1px solid var(--border);border-radius:8px;padding:5px 8px;font:inherit}
+.tr{background:transparent;color:var(--link);border:1px solid var(--input);border-radius:6px;padding:1px 8px;font-size:12px;font-weight:500;margin-left:6px}
+.trad{margin:6px 0 0;padding:6px 10px;background:color-mix(in srgb,currentColor 8%,transparent);border-radius:10px;font-size:13.5px;white-space:pre-wrap}
 .cd>summary{list-style:none;cursor:pointer;position:relative;padding-right:40px}
-.xcard{position:absolute;top:-6px;right:-6px;width:34px;height:34px;padding:0;border-radius:8px;background:#232834;border:1px solid #3a4253;color:#e8ecf3;font-size:15px}
-.xcard:hover{background:#5a2323;border-color:#a33} .cd>summary::-webkit-details-marker{display:none}
-.cd .ultima{display:none} .abrir{float:right;color:#7fb0ff;font-weight:500}
+.xcard{position:absolute;top:-6px;right:-6px;width:34px;height:34px;padding:0;border-radius:8px;background:var(--secondary);border:1px solid var(--input);color:var(--foreground);font-size:15px}
+.xcard:hover{background:var(--er-bg);border-color:var(--destructive)} .cd>summary::-webkit-details-marker{display:none}
+.cd .ultima{display:none} .abrir{float:right;color:var(--link);font-weight:500}
 .topo{display:flex;align-items:center;gap:10px;position:sticky;top:0;z-index:5;background:var(--bg);padding:6px 0}
 .topo h2{flex:1;margin:0;font-size:20px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.voltar,.fechar{display:inline-flex;align-items:center;justify-content:center;width:40px;height:40px;border-radius:10px;background:#232834;border:1px solid #3a4253;font-size:18px;color:#e8ecf3}
-.fechar:hover,.voltar:hover{background:#2e3546}
+.voltar,.fechar{display:inline-flex;align-items:center;justify-content:center;width:40px;height:40px;border-radius:10px;background:var(--secondary);border:1px solid var(--input);font-size:18px;color:var(--foreground)}
+.fechar:hover,.voltar:hover{background:var(--accent)}
 .fab{position:fixed;right:18px;bottom:18px;z-index:20;width:54px;height:54px;border-radius:50%;display:flex;align-items:center;justify-content:center;
-font-size:24px;background:#232834;border:1px solid #3a4253;box-shadow:0 6px 20px #0008} .fab:hover{background:#2e3546}
+font-size:24px;background:var(--secondary);border:1px solid var(--input);box-shadow:0 6px 20px rgb(0 0 0 / .25)} .fab:hover{background:var(--accent)}
 table.rap textarea{min-width:160px;font-family:inherit;font-size:13px}
-.ponto{margin-left:auto;display:flex;align-items:center;gap:8px;background:var(--card);border:1px solid #2a2f39;border-radius:12px;padding:6px 8px 6px 12px;font-size:13px;color:var(--mut)}
-.ponto b{color:var(--tx)} .ponto.on{border-color:#1f7a52} .ponto .crono{font-variant-numeric:tabular-nums}
-.ponto button{padding:6px 12px;font-size:13px} .ponto.on button{background:#5a2323}
+.ponto{margin-left:auto;display:flex;align-items:center;gap:8px;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:6px 8px 6px 12px;font-size:13px;color:var(--mut)}
+.ponto b{color:var(--tx)} .ponto.on{border-color:var(--ok)} .ponto .crono{font-variant-numeric:tabular-nums}
+.ponto button{padding:6px 12px;font-size:13px} .ponto.on button{background:var(--er-bg);color:var(--er-fg)}
 @media (max-width:820px){.marca{flex-wrap:wrap} .ponto{margin-left:0;width:100%;justify-content:space-between}}
-.ok-msg{background:#1f4d3d;color:#9ff0cf;padding:8px 12px;border-radius:8px}
-.taxgrid{display:grid;grid-template-columns:1fr 1fr;gap:12px} .taxf input[type=number]{width:90px;background:#0c0e12;color:var(--tx);border:1px solid #2a2f39;border-radius:8px;padding:6px 8px;font:inherit}
+.ok-msg{background:var(--ok-bg);color:var(--ok-fg);padding:8px 12px;border-radius:8px}
+.taxgrid{display:grid;grid-template-columns:1fr 1fr;gap:12px} .taxf input[type=number]{width:90px;background:var(--field);color:var(--tx);border:1px solid var(--border);border-radius:8px;padding:6px 8px;font:inherit}
 @media (max-width:820px){.taxgrid{grid-template-columns:1fr}}
 .marca{display:flex;align-items:center;gap:10px;margin:0 0 10px} .marca img{width:44px;height:44px}
 .marca span{font-size:17px;color:var(--mut)} .marca b{color:var(--tx)}
 .anexos{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 2px} .ax{max-width:220px;max-height:220px;border-radius:8px;display:block}
-.anexos audio{max-width:100%} .arq{color:#7fb0ff}
-.cit{border-left:3px solid #5fd3a4;background:#151a24;padding:4px 8px;margin:2px 0 4px;font-size:13px;color:#b9c2d0;border-radius:4px}
-.mact{margin-left:6px;opacity:.55} .msg:hover .mact{opacity:1}
+.anexos audio{max-width:100%} .arq{color:var(--link)}
+.cit{background:color-mix(in srgb,currentColor 10%,transparent);padding:4px 9px;margin:2px 0 5px;font-size:12.5px;border-radius:10px;opacity:.9}
+.mact{display:flex;flex-direction:column;opacity:0;transition:opacity .15s} .msg:hover .mact,.mact:focus-within{opacity:1}
 .mact button{background:transparent;border:0;padding:2px 5px;font-size:14px;cursor:pointer;color:inherit}
-.stf{margin:0} .stf button{padding:8px 12px;white-space:nowrap} button.ok{background:#1f7a52}
-.anexar{display:inline-block;margin:6px 0;color:#7fb0ff;cursor:pointer} .anexar input{display:none}
-.busca input{width:100%;box-sizing:border-box;background:#0c0e12;color:var(--tx);border:1px solid #2a2f39;border-radius:8px;padding:8px 10px;margin:8px 0;font:inherit}
+.stf{margin:0} .stf button{padding:8px 12px;white-space:nowrap} button.ok{background:var(--ok)}
+.anexar{display:inline-block;margin:6px 0;color:var(--link);cursor:pointer} .anexar input{display:none}
+.busca input{width:100%;box-sizing:border-box;background:var(--field);color:var(--tx);border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin:8px 0;font:inherit}
 .feed.lista{position:static;max-height:none}
-.mais{display:block;margin:4px auto 10px;font-size:13px} .vermais{display:block;text-align:center;padding:10px 0 2px;color:#7fb0ff;font-size:13px}
-.chart{width:100%;height:auto;display:block} .chart .mk{fill:#5fd3a4} .chart .bar:hover .mk{fill:#8ff0c7}
-.chart .gd{stroke:#2a2f39;stroke-width:1} .chart .bl{stroke:#3a4253;stroke-width:1} .chart .ax{fill:#8b919c;font-size:11px}
-.chart .hc{fill:#5fd3a4;stroke:#111318;stroke-width:2}
+.mais{display:block;margin:4px auto 10px;font-size:13px} .vermais{display:block;text-align:center;padding:10px 0 2px;color:var(--link);font-size:13px}
+.chart{width:100%;height:auto;display:block} .chart .mk{fill:var(--in)} .chart .bar:hover .mk{fill:var(--in)}
+.chart .gd{stroke:var(--border);stroke-width:1} .chart .bl{stroke:var(--input);stroke-width:1} .chart .ax{fill:var(--muted-foreground);font-size:11px}
+.chart .hc{fill:var(--in);stroke:var(--background);stroke-width:2}
 .tile span:last-child{display:block;margin-top:2px}
-a.btn{display:inline-block;background:var(--ac);color:#fff;border-radius:8px;padding:9px 16px;font-weight:600;margin:4px 6px 4px 0}
+a.btn{display:inline-block;background:var(--ac);color:var(--primary-foreground);border-radius:12px;padding:9px 16px;font-weight:600;margin:4px 6px 4px 0}
 .filtros input[type=date]{flex:0 1 auto;min-width:0}
-input[type=time]{background:#0c0e12;color:var(--tx);border:1px solid #2a2f39;border-radius:8px;padding:6px 8px;font:inherit}
+input[type=time]{background:var(--field);color:var(--tx);border:1px solid var(--border);border-radius:8px;padding:6px 8px;font:inherit}
 #convbox{margin:4px 0 8px} #convbox table{font-size:13px}
-.corr{display:flex;gap:6px;margin:-2px 0 6px} .corr button{padding:5px 12px;font-size:13px;border:1px solid #3a4253;border-radius:8px}
-.lbls{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:8px;margin:10px 0 0}
-.lbl{background:#232834;color:#e8ecf3;border:1px solid #3a4253;border-radius:8px;padding:9px 12px;font-weight:600;font-size:14px;text-align:left}
-.lbl:hover{background:#2e3546;border-color:#5a6680} .lbl.on{background:var(--ac);color:#fff;border-color:#6aa1ff;box-shadow:0 0 0 2px #2f7cf655}
+.corr{display:flex;gap:6px;margin:-2px 0 6px} .corr button{padding:5px 12px;font-size:13px;border:1px solid var(--input);border-radius:8px}
+.lbls{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px;margin:10px 0 0}
+.lbl{background:var(--secondary);color:var(--foreground);border:1px solid var(--input);border-radius:8px;padding:9px 12px;font-weight:600;font-size:14px;text-align:left}
+.lbl:hover{background:var(--accent);border-color:var(--muted-foreground)} .lbl.on{background:var(--ac);color:var(--primary-foreground);border-color:var(--ring);box-shadow:0 0 0 2px color-mix(in srgb,var(--primary) 35%,transparent)}
 .ign{position:absolute;right:0;top:6px;width:28px;height:28px;display:flex;align-items:center;justify-content:center;border-radius:7px;
-font-size:14px;opacity:.35;cursor:pointer} .fi:hover .ign{opacity:1;background:#232834} .fi.off{opacity:.55}
-.igl{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid #2a2f39}
+font-size:14px;opacity:.35;cursor:pointer} .fi:hover .ign{opacity:1;background:var(--secondary)} .fi.off{opacity:.55}
+.igl{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--border)}
 @media (max-width:820px){.ign{opacity:.8}}
-.badge{background:var(--in);color:#000;border-radius:9px;padding:0 6px;font-size:11px;margin-left:4px}
-.filtro{display:flex;gap:6px;margin:8px 0} .filtro a{padding:3px 10px;border-radius:12px;background:#0c0e12;color:var(--mut)}
-.filtro a.on{background:var(--ac);color:#fff}
-table{width:100%;border-collapse:collapse;font-size:14px} td,th{padding:7px 6px;border-bottom:1px solid #2a2f39;text-align:left;vertical-align:top}
-th{color:var(--mut);font-weight:500} input[type=search]{width:100%;box-sizing:border-box;background:#0c0e12;color:var(--tx);border:1px solid #2a2f39;border-radius:8px;padding:9px 10px;font:inherit}
+.badge{background:var(--in);color:var(--background);border-radius:9px;padding:0 6px;font-size:11px;margin-left:4px}
+.filtro{display:flex;gap:6px;margin:8px 0} .filtro a{padding:3px 10px;border-radius:12px;background:var(--field);color:var(--mut)}
+.filtro a.on{background:var(--ac);color:var(--primary-foreground)}
+table{width:100%;border-collapse:collapse;font-size:14px} td,th{padding:7px 6px;border-bottom:1px solid var(--border);text-align:left;vertical-align:top}
+th{color:var(--mut);font-weight:500} input[type=search]{width:100%;box-sizing:border-box;background:var(--field);color:var(--tx);border:1px solid var(--border);border-radius:8px;padding:9px 10px;font:inherit}
 .status{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 12px}
 .st{background:var(--card);border-radius:14px;padding:4px 10px;font-size:13px;color:var(--mut)} .st b{color:var(--tx);margin-right:4px}
 .st i{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:middle}
-.st i.ok{background:var(--in);box-shadow:0 0 6px var(--in)} .st i.er{background:#f05252}
-.abas{display:flex;flex-wrap:wrap;gap:4px;margin:0 0 16px;border-bottom:1px solid #2a2f39}
+.st i.ok{background:var(--in);box-shadow:0 0 6px var(--in)} .st i.er{background:var(--destructive)}
+.abas{display:flex;flex-wrap:wrap;gap:4px;margin:0 0 16px;border-bottom:1px solid var(--border)}
 .abas a{padding:8px 14px;color:var(--mut);border-bottom:2px solid transparent} .abas a.on{color:var(--tx);border-color:var(--ac)}
-.filtros{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 12px} .filtros input,.filtros select{background:#0c0e12;color:var(--tx);border:1px solid #2a2f39;border-radius:8px;padding:8px 10px;font:inherit}
+.filtros{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 12px} .filtros input,.filtros select{background:var(--field);color:var(--tx);border:1px solid var(--border);border-radius:8px;padding:8px 10px;font:inherit}
 .filtros input{flex:1;min-width:180px} .tw{overflow-x:auto}
-.sb{border-radius:9px;padding:1px 8px;font-size:12px;background:#2a2f39} .sb.ok{background:#1f4d3d;color:#9ff0cf} .sb.er{background:#5a2323;color:#ffb4b4}
+.sb{border-radius:9px;padding:1px 8px;font-size:12px;background:var(--border)} .sb.ok{background:var(--ok-bg);color:var(--ok-fg)} .sb.er{background:var(--er-bg);color:var(--er-fg)}
 .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:0 0 16px}
-.tile{background:var(--card);border-radius:10px;padding:12px} .tile b{display:block;font-size:22px;margin-top:4px} .tile span{color:var(--mut);font-size:12px}
-.mono{font-family:ui-monospace,monospace;font-size:12px}
+.tile{background:var(--card);border:1px solid var(--border);box-shadow:var(--shadow);border-radius:var(--radius);padding:12px} .tile b{display:block;font-size:22px;margin-top:4px} .tile span{color:var(--mut);font-size:12px}
+.mono{font-family:var(--font-mono);font-size:12px}
+.mem>summary{list-style:none;cursor:pointer;display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 12px}
+.mem>summary::-webkit-details-marker{display:none}
+.mem>summary::after{content:'';margin-left:auto;width:8px;height:8px;border-right:2px solid var(--mut);border-bottom:2px solid var(--mut);transform:rotate(45deg) translateY(-3px);transition:transform .2s cubic-bezier(.16,1,.3,1)}
+.mem[open]>summary::after{transform:rotate(-135deg) translateY(-1px)}
+.mem-tit{font-weight:600;font-size:16px} .mem-sub{color:var(--mut);font-size:13px}
+.mem-corpo{margin-top:14px}
+.mem-resumo{margin:0 0 18px;font-size:15px;line-height:1.6;max-width:70ch;color:var(--foreground)}
+.mem-curto{display:-webkit-box;-webkit-line-clamp:6;-webkit-box-orient:vertical;overflow:hidden;margin-bottom:6px}
+.mem-rd{margin:0 0 18px} .mem-rd>summary{cursor:pointer;color:var(--link);font-size:13px;width:max-content} .mem-rd[open]>summary{display:none}
+.mem-rd .mem-resumo{margin:0} .mem-corpo:has(.mem-rd[open]) .mem-curto{display:none}
+.mem-cols{display:grid;grid-template-columns:1fr 1fr;gap:12px 28px}
+.mem h4{margin:0 0 8px;font-size:13px;font-weight:600;color:var(--tx)} .mem h4 span{color:var(--mut);font-weight:500;margin-left:4px}
+.mem-l{list-style:none;margin:0;padding:0;font-size:14px;line-height:1.5}
+.mem-l li{position:relative;padding:5px 0 5px 22px;border-top:1px solid var(--border)} .mem-l li:first-child{border-top:0}
+.mem-pend li::before{content:'';position:absolute;left:0;top:9px;width:11px;height:11px;border:1.5px solid var(--warn);border-radius:3px}
+.mem-fatos li::before{content:'';position:absolute;left:4px;top:12px;width:5px;height:5px;border-radius:50%;background:var(--mut)}
+.mem-vz{margin:0;color:var(--mut);font-size:13px}
+.mem-fixo{margin:18px 0 0;padding:10px 12px;background:var(--muted);border:1px solid var(--input);border-radius:8px}
+.mem-fixo p{margin:0;white-space:pre-wrap;font-size:14px;line-height:1.5}
+.mem-vazia p{margin:0 0 4px} .mem-vazia{margin:0 0 4px}
+.mem-barra{margin:16px 0 0} .mem-barra .lbl{font-size:13px;padding:7px 12px}
+.mem-ed{margin-top:12px;border-top:1px solid var(--border);padding-top:10px} .mem-ed>summary{cursor:pointer;color:var(--link);font-size:14px;width:max-content}
+.mem-campo{display:block;margin:12px 0 0} .mem-campo>span{display:block;font-size:13px;font-weight:600}
+.mem-campo small{font-weight:400;color:var(--mut);margin-left:6px} .mem-campo textarea{margin:6px 0 0;font-family:inherit;line-height:1.5}
+.mem-ed .acoes{margin-top:10px}
+.mem-pe{margin:12px 0 0} .mem-esq{margin:-6px 0 16px;font-size:13px} .mem-esq a{color:var(--mut)} .mem-esq a:hover{color:var(--er-fg)}
+.mem summary:focus-visible,.mem button:focus-visible,.mem-esq a:focus-visible{outline:2px solid var(--ring);outline-offset:2px;border-radius:4px}
+@media (prefers-reduced-motion:reduce){.mem>summary::after{transition:none}}
+@media (max-width:820px){.mem-cols{grid-template-columns:1fr;gap:16px} .mem-resumo{font-size:16px}}
 @media (max-width:820px){
 .grid{grid-template-columns:minmax(0,1fr);gap:12px}
 /* item de grid/flex cresce até o conteúdo (min-width:auto): a linha de chips alargava a página toda */
@@ -1632,15 +1691,25 @@ textarea,input,select{font-size:16px!important}
 .idi select{width:100%;min-height:42px}
 .msg .tr{padding:4px 10px}
 /* fila no celular: card fechado = bloco com a última mensagem; toque para abrir */
-.cd:not([open]) .ultima{display:block;margin-top:6px;color:#e8ecf3;font-size:15px;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
-.cd:not([open])>summary::after{content:'Toque para responder ›';display:block;margin-top:8px;color:#7fb0ff;font-size:13px}
+.cd:not([open]) .ultima{display:block;margin-top:6px;color:var(--foreground);font-size:15px;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.cd:not([open])>summary::after{content:'Toque para responder ›';display:block;margin-top:8px;color:var(--link);font-size:13px}
 .topo h2{font-size:17px}
 }
+.fila{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:16px;align-items:start} .fila>.card{margin:0} .fila>.vazio{grid-column:1/-1}
+.tema{background:var(--secondary);color:var(--foreground);border:1px solid var(--border);width:40px;height:40px;padding:0;border-radius:12px;font-size:17px;flex:0 0 auto}
+.msg.out .tr{color:inherit;border-color:color-mix(in srgb,currentColor 45%,transparent)}
+@media (max-width:820px){.fila{grid-template-columns:minmax(0,1fr)} .bolha{max-width:86%} .mact{opacity:1} .tema{order:2;margin-left:auto} .ponto{order:3}}
+@media (prefers-reduced-motion:reduce){.mact{transition:none}}
 """
 
 
 def pagina(titulo, principal, filtro, recarregar=True):
     return f"""<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width">
+<meta name=color-scheme content="light dark"><link rel=preconnect href="https://fonts.googleapis.com"><link rel=preconnect href="https://fonts.gstatic.com" crossorigin>
+<link rel=stylesheet href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Roboto+Mono:wght@400;500&display=swap">
+<script>try{{let t=localStorage.getItem('tema');if(t)document.documentElement.dataset.theme=t}}catch(e){{}}
+function trocarTema(){{let r=document.documentElement,esc=r.dataset.theme?r.dataset.theme==='dark':matchMedia('(prefers-color-scheme: dark)').matches;
+r.dataset.theme=esc?'light':'dark';try{{localStorage.setItem('tema',r.dataset.theme)}}catch(e){{}}}}</script>
 <title>{html.escape(titulo)}</title><link rel=icon href="/static/favicon.png?v=2"><link rel=apple-touch-icon href="/static/logo-256.png?v=2">
 <script>
 /* avisos: consulta /novidades a cada 8s; som + contador no título + notificação do navegador */
@@ -1714,7 +1783,7 @@ addEventListener('DOMContentLoaded',()=>{{
 <script>/* recarrega a cada 10s (só fila/conversas), menos enquanto você edita um texto */
 let sujo=false;addEventListener('input',()=>sujo=true);
 if({'true' if recarregar else 'false'})setInterval(()=>{{if(!sujo&&!document.activeElement.matches('textarea'))location.reload()}},20000)</script>
-<style>{CSS}</style><a class=fab href="/config?f={html.escape(filtro)}" title="Configurações">🔧</a><div class=marca><img src="/static/logo-256.png?v=2" alt=""><span>Atendimento <b>Tamino</b></span>{ponto_html()}</div>{status_html()}{abas(titulo, filtro)}
+<style>{CSS}</style><a class=fab href="/config?f={html.escape(filtro)}" title="Configurações">🔧</a><div class=marca><img src="/static/logo-256.png?v=2" alt=""><span>Atendimento <b>Tamino</b></span>{ponto_html()}<button type=button class=tema onclick="trocarTema()" title="Alternar tema claro/escuro" aria-label="Alternar tema claro/escuro">🌓</button></div>{status_html()}{abas(titulo, filtro)}
 <div class=grid><div>{principal}</div>
 <div class=feed><b>Conversas</b>
 <form action=/buscar class=busca><input type=search name=q placeholder="🔎 Buscar conversa…"><input type=hidden name=f value="{html.escape(filtro)}"></form>
@@ -1827,6 +1896,17 @@ def ignorar(conv, nome, sim=True):
             c.execute("delete from ignorados where conv=?", (conv,))
 
 
+def avatar_html(f):
+    """Foto do contato/grupo (thumbnail assinado do Evo) sobre as iniciais: sem foto, ou se a URL expirar, ficam as iniciais.
+    Grupo = quadrado arredondado, contato = círculo."""
+    foto = f.get("foto") or ""
+    img = (f'<img src="{html.escape(foto, quote=True)}" alt="" loading=lazy referrerpolicy=no-referrer onerror="this.remove()">'
+           if foto.startswith("https://") else "")
+    import hashlib
+    h = int(hashlib.sha1(str(f.get("id") or f["nome"]).encode()).hexdigest()[:4], 16) % 360  # cor fixa por conversa: muda de grupo para grupo, não a cada recarga
+    return f'<span class="fav{" gr" if f.get("grupo") else ""}" style="--h:{h}" aria-hidden=true>{html.escape(iniciais(f["nome"]))}{img}</span>'
+
+
 def fi_html(f, filtro, ign=None, cls=None):
     ign = ignorados() if ign is None else ign
     cls = classificacoes_todas() if cls is None else cls
@@ -1835,14 +1915,15 @@ def fi_html(f, filtro, ign=None, cls=None):
     bt = (f'<span class=ign role=button title="{"Voltar a acompanhar" if off else "Ignorar este grupo: sem cards nem avisos"}" '
           f'onclick="event.preventDefault();event.stopPropagation();ignorarConv(\'{html.escape(f["id"])}\',{nome_js},{0 if off else 1})">'
           f'{"🔔" if off else "🔕"}</span>')
-    return (f'<a href="/c/{html.escape(f["id"])}?f={filtro}" class="fi {"in" if f["tipo"] == "incoming" else ""}{" off" if off else ""}">{bt}<span class=n>{html.escape(f["nome"])}</span>'
+    return (f'<a href="/c/{html.escape(f["id"])}?f={filtro}" class="fi {"in" if f["tipo"] == "incoming" else ""}{" off" if off else ""}">{bt}{avatar_html(f)}'
+            f'<span class=fc><span class=n>{html.escape(f["nome"])}</span>'
             f'{"<span class=sb>ignorado</span>" if off else ""}'
             f'{selo_classe(cls.get(f["id"]))}'
             f'{"<span class=n2>N2</span>" if eh_n2(f["nome"]) else ""}'
             f'{"<span class=sb ok>concluída</span>" if f.get("status") == "resolved" else ""}'
             f'{"<span class=badge>" + str(f["pendente"]) + "</span>" if f["pendente"] else ""}'
             f' <small class=t>{html.escape(f["hora"])}</small>'
-            f'<div class=t>{html.escape((f["quem"] + ": ") if f["quem"] else "")}{html.escape(f["texto"][:90])}</div></a>')
+            f'<div class=t>{html.escape((f["quem"] + ": ") if f["quem"] else "")}{html.escape(f["texto"][:90])}</div></span></a>')
 
 
 def audio_mp3(url):
@@ -1896,6 +1977,11 @@ def anexos_html(anexos):
     return f'<div class=anexos>{"".join(out)}</div>' if out else ""
 
 
+def iniciais(nome):
+    p = re.findall(r"\w+", nome or "")
+    return ((p[0][0] + (p[1][0] if len(p) > 1 else "")) if p else "?").upper()
+
+
 def msgs_html(ctx, acoes=False):
     por_id = {m.get("id"): m for m in ctx if m.get("id")}
 
@@ -1918,8 +2004,10 @@ def msgs_html(ctx, acoes=False):
                         f'<button type=button onclick="apagarMsg(\'{mid}\')" title="Apagar">🗑</button>')
             bts += "</span>"
         texto = "<i>mensagem apagada</i>" if m.get("apagada") else html.escape(m["texto"])
-        return (f'<div class="msg {"in" if m["tipo"] == "incoming" else "out"}">{cit}<small>{html.escape(m["hora"])}</small> '
-                f'<b>{html.escape(m["nome"] or "")}</b>: {texto}{trad}{bts}{anexos_html(m.get("anexos"))}</div>')
+        entra = m["tipo"] == "incoming"
+        av = f'<span class=av aria-hidden=true>{html.escape(iniciais(m["nome"]))}</span>' if entra else ""
+        return (f'<div class="msg {"in" if entra else "out"}">{av}<div class=bolha>{cit}<div class=mh><b>{html.escape(m["nome"] or "")}</b>'
+                f'<small>{html.escape(m["hora"])}</small></div>{texto}{trad}{anexos_html(m.get("anexos"))}</div>{bts}</div>')
     return "".join(um(m) for m in ctx if m["texto"] or m.get("anexos"))
 
 
@@ -2349,19 +2437,39 @@ def memoria_html(cid, f, esquecer=False):
     forget = (f"""<form method=post class=card><input type=hidden name=t value="{TOKEN}"><input type=hidden name=conv value="{cid}"><input type=hidden name=f value="{f}">
   <p class=alerta>Apaga memória, escalações, rascunhos e métricas desta conversa. Não dá para desfazer.</p>
   <div class=acoes><button name=acao value=esquecer_cliente>🗑 Apagar tudo desta conversa</button> <a class=btn href="/c/{cid}?f={f}">Cancelar</a></div></form>"""
-              if esquecer else f'<p><a class=btn href="/c/{cid}?f={f}&esquecer=1">🗑 Esquecer cliente</a></p>')
-    quando = datetime.fromtimestamp(m["atualizado"], TZ).strftime("atualizada %d/%m %H:%M") if m["atualizado"] else "vazia"
-    tx = lambda rot, nome, v, n: f'<p class=meta>{rot}</p><textarea name={nome} rows={n}>{html.escape(v)}</textarea>'
-    return f"""<details class=card><summary>🧠 Memória · {quando}</summary><form method=post>
-  <input type=hidden name=t value="{TOKEN}"><input type=hidden name=conv value="{cid}"><input type=hidden name=f value="{f}">
-  {tx("Resumo", "resumo", m["resumo"], 4)}{tx("Pendências (uma por linha)", "pendencias", chr(10).join(m["pendencias"]), 3)}
-  {tx("Fatos (um por linha)", "fatos", chr(10).join(m["fatos"]), 3)}{tx("Notas fixas (suas)", "fixo", m["fixo"], 2)}
-  <p class=meta>As notas fixas a IA não reescreve. Tudo é gravado mascarado (sem CPF, CNPJ, e-mail, telefone nem ID inteiro).</p>
+              if esquecer else f'<p class=mem-esq><a href="/c/{cid}?f={f}&esquecer=1">🗑 Esquecer cliente</a></p>')
+    oculto = f'<input type=hidden name=t value="{TOKEN}"><input type=hidden name=conv value="{cid}"><input type=hidden name=f value="{f}">'
+    e = html.escape
+    pend, fatos, fixo, resumo = m["pendencias"], m["fatos"], m["fixo"].strip(), m["resumo"].strip()
+    vazia = not (pend or fatos or fixo or resumo)
+    quando = (datetime.fromtimestamp(m["atualizado"], TZ).strftime("atualizada %d/%m às %H:%M") if m["atualizado"] else "ainda não gerada")
+    contagem = " · ".join(x for x in (f"{len(pend)} pendência{'s' if len(pend) != 1 else ''}" if pend else "",
+                                      f"{len(fatos)} fato{'s' if len(fatos) != 1 else ''}" if fatos else "") if x)
+    lista = lambda itens, cls, vazio: (f'<ul class="mem-l {cls}">' + "".join(f"<li>{e(x)}</li>" for x in itens) + "</ul>"
+                                       if itens else f'<p class=mem-vz>{vazio}</p>')
+    leitura = (f"""<div class=mem-vazia><p>Ainda não há memória desta conversa.</p>
+  <p class=meta>Ela se forma sozinha conforme a conversa anda. Para gerar agora, use o botão abaixo.</p></div>""" if vazia else f"""
+  {(f'<p class="mem-resumo mem-curto">{e(resumo)}</p><details class=mem-rd><summary>Ler resumo inteiro</summary><p class=mem-resumo>{e(resumo)}</p></details>'
+    if len(resumo) > 420 else f'<p class=mem-resumo>{e(resumo)}</p>') if resumo else ''}
+  <div class=mem-cols>
+    <section><h4>Pendências <span>{len(pend) or ''}</span></h4>{lista(pend, "mem-pend", "Nenhuma pendência em aberto.")}</section>
+    <section><h4>Fatos <span>{len(fatos) or ''}</span></h4>{lista(fatos, "mem-fatos", "Nenhum fato registrado.")}</section>
+  </div>
+  {f'<div class=mem-fixo><h4>Suas notas <span>a IA não reescreve</span></h4><p>{e(fixo)}</p></div>' if fixo else ''}""")
+    tx = lambda rot, dica, nome, v, n: (f'<label class=mem-campo><span>{rot}<small>{dica}</small></span>'
+                                        f'<textarea name={nome} rows={n}>{e(v)}</textarea></label>')
+    return f"""<details class="card mem"{' open' if not vazia else ''}><summary><span class=mem-tit>🧠 Memória da conversa</span>
+  <span class=mem-sub>{quando}{f' · {contagem}' if contagem else ''}</span></summary>
+  <div class=mem-corpo>{leitura}
+  <form method=post class=mem-barra>{oculto}<button name=acao value=mem_atualizar class=lbl>↻ Atualizar agora</button></form>
+  <details class=mem-ed><summary>✏️ Editar memória</summary><form method=post>{oculto}
+  {tx("Resumo", "", "resumo", m["resumo"], 8)}{tx("Pendências", "uma por linha", "pendencias", chr(10).join(pend), max(4, len(pend) + 1))}
+  {tx("Fatos", "um por linha", "fatos", chr(10).join(fatos), max(4, len(fatos) + 1))}{tx("Suas notas", "a IA não reescreve", "fixo", m["fixo"], 3)}
   <div class=acoes><button name=acao value=mem_salvar>Salvar</button>
-  <button name=acao value=mem_atualizar class=sec>Atualizar agora</button>
-  <button name=acao value=mem_limpar class=sec onclick="return confirm('Apagar a memória desta conversa?')">Limpar</button></div>
-</form></details>{forget}"""
-
+  <button name=acao value=mem_limpar class=sec onclick="return confirm('Apagar a memória desta conversa?')">Limpar memória</button></div>
+  </form></details>
+  <p class="meta mem-pe">Tudo fica gravado mascarado: sem CPF, CNPJ, e-mail, telefone nem ID inteiro.</p></div>
+</details>{forget}"""
 
 _WH = {}  # query -> (quando, dados)
 WH_PADRAO = urllib.parse.urlencode({"page": 1, "pageSize": 25})
@@ -3122,7 +3230,7 @@ escalação viva e rascunho pendente ficam. O backup do histórico e os casos do
   <button name=acao value=descartar class=xcard title="Fechar (descartar este card)" onclick="event.stopPropagation()">✕</button>
   <a class=abrir href="/c/{html.escape(cid)}?f={html.escape(filtro)}">abrir conversa ›</a></div>
   <div class=ultima>{html.escape(ultima_msg(det))}</div></summary>
-  {f'<div class=alerta>⚠ {html.escape(al)}</div>' if al else ''}
+  {f'<div class=alerta>⚠ {html.escape(al.lstrip('⚠ '))}</div>' if al else ''}
   {contexto_html(det)}
   {escalada_html(escalada_de(cid), det)}
   {memoria_usada_html(det)}
@@ -3133,7 +3241,7 @@ escalação viva e rascunho pendente ficam. O backup do histórico e os casos do
   <button name=acao value=descartar class=sec>Descartar</button></div>
   </details>
 </form>""" for rid, nome, tx, al, cr, det, cid in rows) or "<p class=vazio>Fila vazia.</p>"
-        self._html(pagina("Fila de respostas", f"<h2>Fila de respostas ({len(rows)})</h2>{cards}", filtro))
+        self._html(pagina("Fila de respostas", f"<h2>Fila de respostas ({len(rows)})</h2><div class=fila>{cards}</div>", filtro))
 
     def _pg(self, titulo, path, corpo, filtro):
         ABA_ATUAL[titulo] = path
@@ -3722,7 +3830,7 @@ class PainelRemoto(Painel):
 <img src="/static/logo-256.png?v=2" alt="" style="width:72px;display:block;margin:0 auto 8px">
 <h2>📱 Parear celular</h2><p class=meta>Digite o código que aparece no painel do computador, aba 📱 Remoto.</p>
 <p class=alerta>{html.escape(msg)}</p><form method=get action=/parear>
-<input name=c inputmode=numeric maxlength=6 autofocus style="font-size:28px;letter-spacing:6px;width:100%;box-sizing:border-box;background:#0c0e12;color:var(--tx);border:1px solid #2a2f39;border-radius:8px;padding:10px">
+<input name=c inputmode=numeric maxlength=6 autofocus style="font-size:28px;letter-spacing:6px;width:100%;box-sizing:border-box;background:var(--field);color:var(--tx);border:1px solid var(--border);border-radius:12px;padding:10px">
 <p><button>Parear</button></p></form></div>""", 401)
 
     def do_GET(self):
@@ -4174,6 +4282,23 @@ def esquecer_cliente(conv):
     return {t: n for t, n in saida.items() if n}
 
 
+def _teste_historico():
+    import tempfile
+    C = "e2222222-1111-1111-1111-111111111111"
+    cfg_salvar(vault_obsidian=tempfile.mkdtemp())  # outro teste pode ter desligado o vault
+    vault = _vault()
+    salvar_mensagens(C, "Grupo H", [{"id": "h1", "tipo": "incoming", "nome": "Ana", "ts": 1795400000, "texto": "meu cpf 123.456.789-09\nsegunda linha"},
+                                    {"id": "h2", "tipo": "outgoing", "nome": "Samuel", "ts": 1795400060, "texto": "Já vejo", "reply": "h1"},
+                                    {"id": "h3", "tipo": "outgoing", "nome": "Samuel", "ts": 1795400090, "texto": "anotação", "privada": True}])
+    exportar_historico(C)
+    nota = vault / "Histórico" / f"Grupo H ({C[:8]}) - conversa.md"
+    t = nota.read_text(encoding="utf-8")
+    assert "123.456" not in t and "[CPF]" in t and "Samuel (suporte)" in t and "🔒 nota interna" in t and "> ↩ Ana:" in t and "segunda linha" in t, t
+    assert f"[[Grupo H ({C[:8]}) - conversa]]" in (vault / "Tamino - Conversas.md").read_text(encoding="utf-8")
+    esquecer_cliente(C)
+    assert not nota.exists()
+
+
 def _teste_backup():
     g = globals()
     C = "e1111111-1111-1111-1111-111111111111"
@@ -4361,7 +4486,60 @@ def _gravar_atomico(p, texto):
 def _indice_obsidian(vault):
     """Nota índice com link para cada nota da pasta Conversas; barata, então é regravada a cada exportação."""
     notas = sorted(p.stem for p in (vault / "Conversas").glob("*.md"))
-    _gravar_atomico(vault / "Tamino - Conversas.md", "# Tamino - Conversas\n\n" + "".join(f"- [[{n}]]\n" for n in notas))
+    hist = sorted(p.stem for p in (vault / "Histórico").glob("*.md"))
+    _gravar_atomico(vault / "Tamino - Conversas.md", "# Tamino - Conversas\n\n## Memórias\n\n" + "".join(f"- [[{n}]]\n" for n in notas)
+                    + "\n## Conversas completas\n\n" + "".join(f"- [[{n}]]\n" for n in hist))
+
+
+def _nome_nota(conv):
+    """(nome mascarado, nome seguro para arquivo) da conversa, iguais na nota de memória e na de histórico."""
+    with db() as c:
+        salvo = c.execute("select nome_conv from mensagens where conversa=? and nome_conv!='' order by ts desc limit 1", (conv,)).fetchone()
+    nome = mascarar(next((f["nome"] for f in FEED if f["id"] == conv), "") or (salvo[0] if salvo else ""))
+    limpo = " ".join(re.sub(r'[\x00-\x1f\\/:*?"<>|#^\[\]]', " ", nome).split()).strip(".")[:80] or "conversa"  # caracteres que o Obsidian/SO não aceitam
+    return nome, limpo
+
+
+def _historicos_de(vault, conv):
+    return [p for p in (vault / "Histórico").glob("*.md") if p.name.endswith(f" ({conv[:8]}) - conversa.md")]
+
+
+def exportar_historico(conv):
+    """A conversa INTEIRA do backup local como nota no vault (pasta Histórico), mascarada como a memória.
+    Regravada inteira a cada mensagem nova: barato com até alguns milhares de mensagens. Nunca lança."""
+    try:
+        vault = _vault()
+        if not vault:
+            return
+        msgs = [m for m in mensagens_de(conv) if (m["texto"] or "").strip()]
+        if not msgs:
+            return
+        nome, limpo = _nome_nota(conv)
+        arq = vault / "Histórico" / f"{limpo} ({conv[:8]}) - conversa.md"
+        por_id = {str(m["id"]): m for m in msgs}
+        linhas, dia = [], None
+        for m in msgs:
+            d = datetime.fromtimestamp(m["ts"], TZ) if m["ts"] else None
+            if d and d.strftime("%d/%m/%Y") != dia:
+                dia = d.strftime("%d/%m/%Y")
+                linhas.append(f"\n## {dia}\n")
+            quem = mascarar(m["nome"] or "?") + ("" if m["tipo"] == "incoming" else " (suporte)")
+            marca = " 🔒 nota interna" if m.get("privada") else ""
+            cit = por_id.get(str(m.get("reply") or ""))
+            citacao = f"> ↩ {mascarar(cit['nome'] or '')}: {mascarar(' '.join(cit['texto'].split()))[:140]}\n" if cit else ""
+            texto = mascarar(m["texto"].strip()).replace("\n", "  \n")  # quebra de linha que o Markdown respeita
+            linhas.append(f"{citacao}**{d.strftime('%H:%M') if d else '--:--'} · {quem}**{marca}  \n{texto}\n")
+        ini = datetime.fromtimestamp(msgs[0]["ts"], TZ).strftime("%d/%m/%Y")
+        _gravar_atomico(arq, f"---\nconversa: {conv}\ngrupo: {json.dumps(nome, ensure_ascii=False)}\nmensagens: {len(msgs)}\n"
+                             f"desde: {ini}\natualizado: {datetime.now(TZ).isoformat(timespec='seconds')}\ntags: [tamino, conversa]\n---\n\n"
+                             f"# {nome or 'conversa'}\n\nMemória: [[{limpo} ({conv[:8]})]] · CPF, CNPJ, e-mail, telefone e IDs inteiros vêm mascarados.\n"
+                             + "\n".join(linhas))
+        for p in _historicos_de(vault, conv):
+            if p != arq:
+                p.unlink()  # o grupo mudou de nome
+        _indice_obsidian(vault)
+    except Exception as e:
+        log(f"[obsidian] histórico {str(conv)[:8]}: {e}")
 
 
 def exportar_obsidian(conv):
@@ -4371,16 +4549,14 @@ def exportar_obsidian(conv):
         if not vault:
             return
         m = mem_ler(conv)
-        with db() as c:
-            salvo = c.execute("select max(nome_conv) from mensagens where conversa=?", (conv,)).fetchone()[0]
-        nome = mascarar(next((f["nome"] for f in FEED if f["id"] == conv), "") or salvo or "")
-        limpo = " ".join(re.sub(r'[\\/:*?"<>|#^\[\]]', " ", nome).split()).strip(".")[:80] or "conversa"  # caracteres que o Obsidian/SO não aceitam em nome
+        nome, limpo = _nome_nota(conv)
         arq = vault / "Conversas" / f"{limpo} ({conv[:8]}).md"
         quando = datetime.fromtimestamp(m["atualizado"] or time.time(), TZ).isoformat(timespec="seconds")
         lista = lambda itens, marca: "".join(f"{marca}{' '.join(i.split())}\n" for i in itens)
         _gravar_atomico(arq, f"---\nconversa: {conv}\ngrupo: {json.dumps(nome, ensure_ascii=False)}\natualizado: {quando}\ntags: [tamino, memoria]\n---\n\n"
                              f"## Resumo\n\n{m['resumo']}\n\n## Pendências\n\n{lista(m['pendencias'], '- [ ] ')}\n"
-                             f"## Fatos\n\n{lista(m['fatos'], '- ')}\n## Fixo (anotado pelo atendente)\n\n{m['fixo']}\n")
+                             f"## Fatos\n\n{lista(m['fatos'], '- ')}\n## Fixo (anotado pelo atendente)\n\n{m['fixo']}\n\n"
+                             f"## Conversa completa\n\n[[{limpo} ({conv[:8]}) - conversa]]\n")
         for p in _notas_de(vault, conv):
             if p != arq:
                 p.unlink()  # o grupo mudou de nome: sobra a nota antiga
@@ -4393,8 +4569,8 @@ def apagar_nota_obsidian(conv):
     """Remove a nota da conversa e atualiza o índice. Nunca lança."""
     try:
         vault = _vault()
-        if vault and (vault / "Conversas").is_dir():
-            for p in _notas_de(vault, conv):
+        if vault and vault.is_dir():
+            for p in _notas_de(vault, conv) + _historicos_de(vault, conv):
                 p.unlink()
             _indice_obsidian(vault)
     except Exception as e:
@@ -4686,6 +4862,7 @@ def teste():
     orig = {k: g[k] for k in ("DB", "tamino_lookup", "evo_enviar", "evo_historico", "_redigir_api", "_redigir_claude_code",
                               "ia", "em_segundo_plano")}
     g["DB"] = Path(tempfile.mkdtemp()) / "teste.db"  # antes de qualquer cfg()/db(): nada toca o fila.db real
+    cfg_salvar(vault_obsidian=str(g["DB"].parent / "vault"))  # nem o vault real do Obsidian
     env0 = {k: os.environ.pop(k) for k in ("N2_AUTO", "MEMORIA_AUTO", "ANTHROPIC_API_KEY", "CONV_N2", "GRUPO_N2") if k in os.environ}
     feed0, ev0 = FEED[:], EVENTOS[:]
     nada = lambda *a, **k: (_ for _ in ()).throw(AssertionError(f"rede/IA chamada no teste: {a[:1]}"))
@@ -4701,6 +4878,7 @@ def teste():
         _teste_classifica()
         _teste_retencao()
         _teste_backup()
+        _teste_historico()
     finally:
         g.update(orig)
         os.environ.update(env0)
@@ -4962,6 +5140,14 @@ if __name__ == "__main__":
         for conv, (nome, lidas, novas) in r.items():
             print(f"{conv[:8]} {nome[:30]:30} {lidas:5} lidas {novas:5} novas")
         print(f"{len(r)} conversas, {sum(x[2] for x in r.values())} mensagens novas")
+        for conv in r:
+            exportar_historico(conv)
+    elif modo == "historico":  # (re)grava no Obsidian a conversa inteira de cada grupo, a partir do backup local
+        with db() as c:
+            convs = [r[0] for r in c.execute("select distinct conversa from mensagens")]
+        for conv in convs:
+            exportar_historico(conv)
+        print(f"{len(convs)} conversas no vault {_vault()}")
     elif modo == "memorias":  # memória de todas as conversas do backup local; retomável (só faz o que falta); usa IA, não o Evo
         with db() as c:
             convs = c.execute("select conversa, max(nome_conv), max(ts) t from mensagens group by conversa order by t desc").fetchall()
