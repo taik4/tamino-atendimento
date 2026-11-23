@@ -552,8 +552,8 @@ def card_imediato(conv, nome, historico):
 
 
 def notificar_bark(titulo, texto):
-    """Alarme no iPhone pelo app Bark. Liga com BARK_KEY no .env; manda só o nome da conversa, nunca o texto do cliente."""
-    chave = os.environ.get("BARK_KEY", "").strip()
+    """Alarme no iPhone pelo app Bark. Chave em ⚙️ Configurações (ou BARK_KEY no .env); manda só o nome da conversa, nunca o texto do cliente."""
+    chave = cfg("bark_key").strip()
     if not chave:
         return False
     corpo = {"device_key": chave, "title": titulo, "body": texto, "group": "Tamino",
@@ -3276,6 +3276,13 @@ ligue só em rede confiável. Desligar desconecta todos os celulares.</p>"""
 <p><label><input type=checkbox name=notif_desktop value=1 {"checked" if cfg("notif_desktop", "1") == "1" else ""}> Notificação do KDE no computador (funciona com o navegador fechado)</label></p>
 <p><label><input type=checkbox name=notif_som value=1 {"checked" if cfg("notif_som", "1") == "1" else ""}> Tocar som no computador</label></p>
 <button name=acao value=config_notif>Salvar</button></form>
+<form method=post style="margin-top:16px">{T}
+<p><b>📱 Alarme no iPhone (app Bark)</b> · {"<span style='color:var(--ok,#3c3)'>ligado</span> (chave …" + html.escape(cfg("bark_key")[-4:]) + ")" if cfg("bark_key") else "desligado"}</p>
+<p><input type=password name=bark_key autocomplete=off placeholder="Cole a chave ou o link do Bark (https://api.day.app/…)" style="width:100%"></p>
+<p class=meta>Toca um alarme quando um card novo entra na fila (mesmo no silencioso, se o iPhone permitir Alertas Críticos do Bark). Só o nome da conversa vai para o Bark.</p>
+<button name=acao value=config_bark>Salvar chave</button>
+<button name=acao value=config_bark_teste class=sec>Testar</button>
+<button name=acao value=config_bark_remover class=sec>Desligar</button></form>
 <p style="margin-top:12px"><button type=button class=sec onclick="ativarNotif(this)">🔔 Ativar notificações deste navegador</button></p>
 <p class=meta>Com o painel aberto, toda mensagem nova toca um bip e mostra o contador na aba, ex.: "(2) Fila".
 No iPhone pelo controle remoto, o Safari não permite notificação fora da página (exige HTTPS); o bip e o contador funcionam com o painel aberto, depois do primeiro toque na tela.</p></div>
@@ -3358,6 +3365,17 @@ escalação viva e rascunho pendente ficam. O backup do histórico e os casos do
             if m in ("claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"):
                 cfg_salvar(claude_model=m)
             cfg_salvar(rascunho_auto="1" if f.get("rascunho_auto") == "1" else "0")
+        elif a == "config_bark" and f.get("bark_key", "").strip():
+            v = f["bark_key"].strip()
+            m = re.search(r"day\.app/([^/?#\s]+)", v)  # aceita o link inteiro que o app mostra
+            v = m.group(1) if m else v
+            if not re.fullmatch(r"[A-Za-z0-9_-]{8,100}", v):
+                return self._html(pagina("Configurações", "<p>Chave do Bark inválida: cole só o trecho depois de https://api.day.app/</p><a href=/config>voltar</a>", "novas"), 400)
+            cfg_salvar(bark_key=v)
+        elif a == "config_bark_teste":
+            notificar_bark("Teste do painel", "Se tocou, o alarme da fila está ok")
+        elif a == "config_bark_remover":
+            cfg_salvar(bark_key="")  # vazio também desliga o BARK_KEY do .env
         elif a == "config_nome" and f.get("atendente", "").strip():
             cfg_salvar(atendente=f["atendente"].strip()[:40])
         elif a == "config_ponto":
