@@ -18,6 +18,7 @@ import re
 import secrets
 import sqlite3
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -513,11 +514,38 @@ def db():
 
 
 def enfileirar(conv, texto, detalhes, alerta, nome=None):
+    """Um card por conversa: se já há um pendente, atualiza ele (mesmo id); senão cria."""
     with db() as c:
-        c.execute("update rascunhos set status='substituido' where conversa=? and status='pendente'", (conv,))
-        cur = c.execute("insert into rascunhos(conversa,texto,detalhes,alerta,criado,nome) values(?,?,?,?,?,?)",
-                        (conv, texto, json.dumps(detalhes, ensure_ascii=False), alerta, time.time(), nome))
-        return cur.lastrowid
+        ids = [r[0] for r in c.execute("select id from rascunhos where conversa=? and status='pendente' order by id desc", (conv,))]
+        dados = (texto, json.dumps(detalhes, ensure_ascii=False), alerta, nome)
+        if ids:
+            c.execute("update rascunhos set texto=?, detalhes=?, alerta=?, nome=coalesce(?, nome) where id=?", (*dados, ids[0]))
+            c.executemany("update rascunhos set status='substituido' where id=?", [(i,) for i in ids[1:]])  # sobra de versão antiga
+            rid = ids[0]
+        else:
+            rid = c.execute("insert into rascunhos(conversa,texto,detalhes,alerta,nome,criado) values(?,?,?,?,?,?)",
+                            (conv, *dados, time.time())).lastrowid
+    CARDS_MUDARAM.append((time.time(), conv, rid))
+    del CARDS_MUDARAM[:-100]
+    return rid
+
+
+CARDS_MUDARAM = []  # (quando, conv, rascunho_id): o navegador atualiza o card aberto sem recarregar a página
+
+
+def rotulo_alerta(al):
+    """Texto do alerta no card: ⚠ na frente, menos no aviso de "IA redigindo", que não é problema."""
+    al = (al or "").lstrip("⚠ ")
+    return "" if not al else al if al.startswith("✍️") else "⚠ " + al
+
+
+def card_imediato(conv, nome, historico):
+    """Assim que a mensagem chega: o card aparece (ou o já existente ganha as mensagens novas) antes da IA terminar."""
+    with db() as c:
+        r = c.execute("select texto, detalhes from rascunhos where conversa=? and status='pendente' order by id desc limit 1", (conv,)).fetchone()
+    det = det_json(r[1]) if r else {}
+    det.update(contexto=[m for m in historico[-8:] if m["texto"]], redigindo=True)
+    return enfileirar(conv, r[0] if r else MSG_ESPERA, det, "✍️ A IA está redigindo a resposta…", nome)
 
 
 def enviar_espera(conv):
@@ -556,7 +584,7 @@ def salvar_idioma(conv, lang):
             c.execute("insert or replace into idiomas values(?,?)", (conv, lang))
 
 
-def preparar_resposta(conv, ids=None, tenant_esperado=None, nome=None, historico=None, resposta_n2=""):
+def preparar_resposta(conv, ids=None, tenant_esperado=None, nome=None, historico=None, resposta_n2="", valido=None):
     historico = historico if historico is not None else evo_historico(conv)
     ids = ids if ids is not None else extrair_ids("\n".join(m["texto"] for m in historico if m["tipo"] == "incoming"))
     resumos = []
@@ -618,6 +646,8 @@ def preparar_resposta(conv, ids=None, tenant_esperado=None, nome=None, historico
         texto = versoes["info"] if resumos else versoes["generico"]
     alerta = " ".join(alertas) or None
     contexto = [m for m in historico[-8:] if m["texto"]]
+    if valido and not valido():
+        return None  # chegou mensagem nova enquanto a IA redigia: a geração seguinte grava
     rid = enfileirar(conv, texto, {"consultas": resumos, "contexto": contexto, "versoes": versoes, "memoria": memoria, "sigilo": sigilo}, alerta, nome)
     escalada = None
     if esc and esc["motivo"] == "pending_clarification":
@@ -1123,7 +1153,7 @@ def _redigir_api(modelo, pedido, sistema=None, limpar=True, tipo="outro", conv="
 
 
 # ---------- vigia ----------
-VIGIA_INTERVALO_S = 5
+VIGIA_INTERVALO_S = 2  # 1 GET leve no Evo por volta
 _POOL = None
 _POOL_MEM = None
 
@@ -1407,8 +1437,19 @@ def notificar_desktop(titulo, texto, som=True):
         subprocess.Popen([tocador, str(arq)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def tratar(conv, nome):
+_GERACAO = {}  # conv -> nº da última mensagem tratada
+
+
+def _tratar(conv, nome):
+    g = _GERACAO[conv] = _GERACAO.get(conv, 0) + 1
     hist = evo_historico(conv)
+    if cfg("rascunho_auto", "1") == "1":
+        card_imediato(conv, nome, hist)
+    time.sleep(RAJADA_S)  # cliente manda várias seguidas: espera um pouco e redige uma vez só, com tudo
+    if _GERACAO.get(conv) != g:
+        return
+    if RAJADA_S:
+        hist = evo_historico(conv)
     if cfg("classificar_auto", "1") == "1" and not eh_n2(nome) and hist:
         _CLASSIF_PEDIDO[conv] = str(hist[-1]["id"])
         em_segundo_plano(classificar, conv, hist)
@@ -1420,7 +1461,24 @@ def tratar(conv, nome):
     if cfg("rascunho_auto", "1") != "1":
         log(f"[vigia] {nome}: rascunho automático desligado")
         return
-    preparar_resposta(conv, ids=ids, nome=nome, historico=hist)
+    preparar_resposta(conv, ids=ids, nome=nome, historico=hist, valido=lambda: _GERACAO.get(conv) == g)
+
+
+def tratar(conv, nome):
+    """Rascunho da mensagem nova. Se algo falha depois do card imediato, o card avisa em vez de ficar "redigindo" para sempre."""
+    try:
+        _tratar(conv, nome)
+    except Exception as e:
+        log(f"[vigia] {nome}: rascunho falhou: {e}")
+        with db() as c:
+            r = c.execute("select texto, detalhes from rascunhos where conversa=? and status='pendente' order by id desc limit 1", (conv,)).fetchone()
+        if r and det_json(r[1]).get("redigindo"):
+            det = det_json(r[1]) | {"redigindo": False}
+            enfileirar(conv, r[0], det, "O rascunho automático falhou. Responda à mão ou use Gerar rascunho na conversa.", nome)
+        raise
+
+
+RAJADA_S = 3
 
 
 def vigia():
@@ -1524,6 +1582,24 @@ TOKEN = secrets.token_urlsafe(16)  # anti-CSRF: só o painel aberto agora conseg
 
 RE_CONV = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
+# ---------- casca React (web/ -> static/app) ----------
+_REQ = threading.local()  # .embed = True enquanto atende /classico/<rota>?embed=1 (pagina() devolve só o conteúdo)
+# rotas em que o navegador recebe static/app/index.html (quando o build existe); o resto segue o roteamento antigo
+RE_SPA = re.compile(r"/(?:|c/[0-9a-f-]{36}|insights|dashboard|saques|pagamentos|webhooks|usuarios|taxas(?:/[0-9a-f-]{36})?|config|remoto|buscar)")
+TIPOS_APP = {".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png",
+             ".woff2": "font/woff2", ".json": "application/json", ".html": "text/html; charset=utf-8"}
+# embed: formulário GET sem action iria para /classico/<rota> na janela de cima (tela antiga inteira); manda para a rota da casca
+EMBED_JS = ("<script>addEventListener('submit',e=>{let f=e.target;if(f.method==='get'&&!f.getAttribute('action'))"
+            "f.action=location.pathname.slice(9)||'/'},true);"
+            "addEventListener('click',e=>{let a=e.target.closest&&e.target.closest('a[href]');"
+            "if(!a||e.defaultPrevented||e.button||e.ctrlKey||e.metaKey||e.shiftKey||a.target==='_blank'||a.hasAttribute('download'))return;"
+            "let u=new URL(a.href,location.href);if(u.origin!==location.origin||u.pathname.startsWith('/classico')||u.pathname.startsWith('/audio')"
+            "||u.pathname.startsWith('/insights/exportar')||u.pathname.startsWith('/static'))return;"
+            "try{e.preventDefault();top.history.pushState(null,'',u.pathname+u.search);top.dispatchEvent(new PopStateEvent('popstate'))}"
+            "catch(_){location.href=u.href}},true)</script>")
+RE_SESSAO = re.compile(r"^[0-9a-f-]{36}$")  # id de sessão do Claude Code: só isso vira argumento do --resume
+_CLAUDE_LOCK = threading.Lock()  # /api/claude: um pedido por vez
+
 CSS = """
 :root{color-scheme:light;--card:#f5f5f4;--ring:#6366f1;--input:#d6d3d1;--muted:#e7e5e4;--accent:#f3e5f5;--border:#d6d3d1;--radius:1.25rem;
 --chart-1:#6366f1;--chart-2:#4f46e5;--chart-3:#4338ca;--primary:#6366f1;--secondary:#d6d3d1;--background:#e7e5e4;--foreground:#1e293b;
@@ -1575,10 +1651,26 @@ font-size:12px;font-weight:700;color:#fff;background:linear-gradient(135deg,var(
 .idi{margin:8px 0 0} .idi select{background:var(--field);color:var(--tx);border:1px solid var(--border);border-radius:8px;padding:5px 8px;font:inherit}
 .tr{background:transparent;color:var(--link);border:1px solid var(--input);border-radius:6px;padding:1px 8px;font-size:12px;font-weight:500;margin-left:6px}
 .trad{margin:6px 0 0;padding:6px 10px;background:color-mix(in srgb,currentColor 8%,transparent);border-radius:10px;font-size:13.5px;white-space:pre-wrap}
-.cd>summary{list-style:none;cursor:pointer;position:relative;padding-right:40px}
-.xcard{position:absolute;top:-6px;right:-6px;width:34px;height:34px;padding:0;border-radius:8px;background:var(--secondary);border:1px solid var(--input);color:var(--foreground);font-size:15px}
+.cd>summary{list-style:none;cursor:pointer;position:relative;border-radius:14px}
+.xcard{position:absolute;top:12px;right:12px;width:34px;height:34px;padding:0;border-radius:8px;background:var(--secondary);border:1px solid var(--input);color:var(--foreground);font-size:15px}
 .xcard:hover{background:var(--er-bg);border-color:var(--destructive)} .cd>summary::-webkit-details-marker{display:none}
-.cd .ultima{display:none} .abrir{float:right;color:var(--link);font-weight:500}
+.abrir{margin-left:auto;align-self:center;color:var(--link);font-weight:500;font-size:14px}
+.fcard{position:relative;transition:border-color .15s,box-shadow .15s}
+.fcard .xcard{top:10px;right:10px;z-index:3;width:40px;height:40px;border-radius:12px;font-size:16px;cursor:pointer} /* acima do summary, que cobria o botão */
+.fcard:has(.cd:not([open])):hover{border-color:color-mix(in srgb,var(--primary) 55%,var(--border))}
+.ch{display:flex;gap:10px;align-items:center;padding-right:48px} .cm{flex:1;min-width:0}
+.cn{display:flex;flex-wrap:wrap;align-items:center;gap:2px 8px} .cn b{font-size:15px;line-height:1.3;overflow-wrap:anywhere;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.cm>small{display:block;color:var(--muted-foreground);font-size:12px;margin-top:2px;font-variant-numeric:tabular-nums}
+.cd .ultima{margin:10px 0 0;font-size:14px;line-height:1.45;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow-wrap:anywhere}
+.calerta{margin:8px 0 0;font-size:12.5px;color:var(--warn);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cfoot{margin-top:10px;font-size:13px;font-weight:600;color:var(--link)} .cd .fecha,.cd[open] .abre,.cd[open] .ultima{display:none}
+.cd[open] .calerta{white-space:normal;font-size:13.5px} .calerta[hidden],.novas[hidden]{display:none}
+.novas{margin:8px 0 0;font-size:12.5px;font-weight:600;color:var(--in)}
+.fila-nova{display:block;width:100%;margin:0 0 12px;background:color-mix(in srgb,var(--primary) 14%,var(--card));color:var(--foreground);border:1px solid color-mix(in srgb,var(--primary) 45%,var(--border))}
+.cd[open] .fecha{display:inline} .cd[open]>summary{margin-bottom:6px} .cd[open] .cfoot{margin-top:6px}
+.cd[open]>summary+*{margin-top:4px} .cd .acoes{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.fila>.card:has(.cd[open]){grid-column:1/-1}
+.msis{text-align:center;font-size:12px;color:var(--muted-foreground);margin:10px auto;max-width:90%}
 .topo{display:flex;align-items:center;gap:10px;position:sticky;top:0;z-index:5;background:var(--bg);padding:6px 0}
 .topo h2{flex:1;margin:0;font-size:20px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .voltar,.fechar{display:inline-flex;align-items:center;justify-content:center;width:40px;height:40px;border-radius:10px;background:var(--secondary);border:1px solid var(--input);font-size:18px;color:var(--foreground)}
@@ -1691,20 +1783,20 @@ textarea,input,select{font-size:16px!important}
 .idi select{width:100%;min-height:42px}
 .msg .tr{padding:4px 10px}
 /* fila no celular: card fechado = bloco com a última mensagem; toque para abrir */
-.cd:not([open]) .ultima{display:block;margin-top:6px;color:var(--foreground);font-size:15px;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
-.cd:not([open])>summary::after{content:'Toque para responder ›';display:block;margin-top:8px;color:var(--link);font-size:13px}
+.cd .acoes .abrir{flex-basis:100%;text-align:center;margin:4px 0 0}
 .topo h2{font-size:17px}
 }
 .fila{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:16px;align-items:start} .fila>.card{margin:0} .fila>.vazio{grid-column:1/-1}
 .tema{background:var(--secondary);color:var(--foreground);border:1px solid var(--border);width:40px;height:40px;padding:0;border-radius:12px;font-size:17px;flex:0 0 auto}
 .msg.out .tr{color:inherit;border-color:color-mix(in srgb,currentColor 45%,transparent)}
-@media (max-width:820px){.fila{grid-template-columns:minmax(0,1fr)} .bolha{max-width:86%} .mact{opacity:1} .tema{order:2;margin-left:auto} .ponto{order:3}}
+@media (max-width:820px){.fcard .xcard{width:44px;height:44px;top:8px;right:8px} body{padding-bottom:84px} body:has(details.cd[open]) .fab{display:none} .fila{grid-template-columns:minmax(0,1fr)} .bolha{max-width:86%} .mact{opacity:1} .tema{order:2;margin-left:auto} .ponto{order:3}}
 @media (prefers-reduced-motion:reduce){.mact{transition:none}}
 """
 
 
 def pagina(titulo, principal, filtro, recarregar=True):
-    return f"""<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width">
+    embed = getattr(_REQ, "embed", False)  # dentro da casca React: sem marca, status, abas, feed nem 🔧
+    return f"""<!doctype html><meta charset=utf-8>{"<base target=_top>" if embed else ""}<meta name=viewport content="width=device-width">
 <meta name=color-scheme content="light dark"><link rel=preconnect href="https://fonts.googleapis.com"><link rel=preconnect href="https://fonts.gstatic.com" crossorigin>
 <link rel=stylesheet href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Roboto+Mono:wght@400;500&display=swap">
 <script>try{{let t=localStorage.getItem('tema');if(t)document.documentElement.dataset.theme=t}}catch(e){{}}
@@ -1718,9 +1810,24 @@ function bip(){{try{{let a=new (window.AudioContext||window.webkitAudioContext)(
 o.connect(g);g.connect(a.destination);o.frequency.value=880;g.gain.setValueAtTime(.15,a.currentTime);
 g.gain.exponentialRampToValueAtTime(.001,a.currentTime+.35);o.start();o.stop(a.currentTime+.35)}}catch(e){{}}}}
 function marcaTitulo(){{document.title=(naoLidas?'('+naoLidas+') ':'')+titulo0}}
+function atualizarCard(id,f){{fetch('/card/'+id).then(r=>r.json()).then(c=>{{
+  if(!c.existe){{f.remove();return}}
+  let q=s=>f.querySelector(s),cv=q('.conv'),lb=q('.lbls'),a=q('.calerta');
+  if(cv&&c.conv){{cv.outerHTML=c.conv;let n=q('.conv');n.scrollTop=n.scrollHeight}}
+  if(lb&&c.versoes){{let on=lb.querySelector('.lbl.on');lb.outerHTML=c.versoes}}
+  a.hidden=!c.alerta;a.innerHTML=c.alerta;
+  q('.ultima').innerHTML=c.ultima;q('.novas').hidden=!q('details.cd').open}}).catch(()=>{{}})}}
+function avisoFila(){{if(document.querySelector('.fila-nova'))return;let b=document.createElement('button');
+  b.type='button';b.className='fila-nova';b.textContent='↻ Card novo na fila · atualizar';b.onclick=()=>location.reload();
+  let fl=document.querySelector('.fila');if(fl)fl.before(b)}}
 function checar(){{fetch('/novidades?desde='+desde).then(r=>r.json()).then(d=>{{
   if(!desde){{desde=d.agora;sessionStorage.setItem('desde',desde);return}}
   desde=d.agora;sessionStorage.setItem('desde',desde);
+  /* cards mudaram (mensagem nova ou IA terminou): o aberto se atualiza no lugar; sem card aberto, a fila recarrega */
+  let fila=location.pathname==='/',cards=d.cards||[];
+  cards.forEach(id=>{{let det=document.querySelector('details.cd[data-id="'+id+'"]');
+    if(det)atualizarCard(id,det.closest('form'));else if(fila&&sujo)avisoFila()}});
+  if(fila&&cards.length&&!sujo&&!document.activeElement.matches('textarea'))setTimeout(()=>location.reload(),300);
   if(!d.eventos.length)return;
   /* mensagem nova: recarrega a conversa aberta (se for dela) ou a fila, sem atrapalhar quem está digitando */
   if(!sujo&&!document.activeElement.matches('textarea')&&(location.pathname==='/'||d.eventos.some(e=>location.pathname==='/c/'+e.conv)))
@@ -1730,7 +1837,8 @@ function checar(){{fetch('/novidades?desde='+desde).then(r=>r.json()).then(d=>{{
     let n=new Notification(e.nome,{{body:e.texto,icon:'/static/logo-256.png?v=2',tag:e.conv}});n.onclick=()=>{{focus();location='/c/'+e.conv}}}});
 }}).catch(()=>{{}})}}
 addEventListener('focus',()=>{{naoLidas=0;sessionStorage.setItem('naoLidas',0);marcaTitulo()}});
-addEventListener('DOMContentLoaded',()=>{{marcaTitulo();checar();setInterval(checar,3000)}});
+/* dentro da casca React (iframe) quem avisa é a casca: sem bip nem notificação em dobro */
+addEventListener('DOMContentLoaded',()=>{{marcaTitulo();if(self!==top)return;checar();setInterval(checar,2000)}});
 /* tempo ativo: conta 1 minuto se a página está visível e houve interação nos últimos 3 min */
 let ultInteracao=Date.now();['mousemove','keydown','touchstart','click','scroll'].forEach(e=>addEventListener(e,()=>ultInteracao=Date.now(),{{passive:true}}));
 setInterval(()=>{{if(document.visibilityState==='visible'&&Date.now()-ultInteracao<180000)fetch('/ping',{{method:'POST'}}).catch(()=>{{}})}},60000);
@@ -1776,27 +1884,37 @@ let d=document.createElement('div');d.className='trad';d.textContent='🇧🇷 '
 </script>
 <script>
 addEventListener('DOMContentLoaded',()=>{{
-  if(matchMedia('(max-width:820px)').matches)document.querySelectorAll('details.cd').forEach(d=>d.open=false);
-  document.querySelectorAll('details.cd').forEach(d=>d.addEventListener('toggle',()=>{{if(d.open&&matchMedia('(max-width:820px)').matches)sujo=true}}));
+  let abertos=()=>{{try{{return new Set(JSON.parse(sessionStorage.getItem('abertos')||'[]'))}}catch(e){{return new Set()}}}};
+  let ab=abertos();
+  document.querySelectorAll('details.cd').forEach(d=>{{
+    if(ab.has(d.dataset.id))d.open=true;
+    d.addEventListener('toggle',()=>{{let s=abertos();d.open?s.add(d.dataset.id):s.delete(d.dataset.id);
+      try{{sessionStorage.setItem('abertos',JSON.stringify([...s]))}}catch(e){{}}
+      if(d.open){{sujo=true;d.closest('form').scrollIntoView({{block:'nearest'}})}}}})}});
+  if([...document.querySelectorAll('details.cd')].some(d=>d.open))sujo=true;
 }});
 </script>
 <script>/* recarrega a cada 10s (só fila/conversas), menos enquanto você edita um texto */
 let sujo=false;addEventListener('input',()=>sujo=true);
 if({'true' if recarregar else 'false'})setInterval(()=>{{if(!sujo&&!document.activeElement.matches('textarea'))location.reload()}},20000)</script>
-<style>{CSS}</style><a class=fab href="/config?f={html.escape(filtro)}" title="Configurações">🔧</a><div class=marca><img src="/static/logo-256.png?v=2" alt=""><span>Atendimento <b>Tamino</b></span>{ponto_html()}<button type=button class=tema onclick="trocarTema()" title="Alternar tema claro/escuro" aria-label="Alternar tema claro/escuro">🌓</button></div>{status_html()}{abas(titulo, filtro)}
+<style>{CSS}</style>""" + (f'{EMBED_JS}<div class=grid style="grid-template-columns:minmax(0,1fr)"><div>{principal}</div></div>' if embed else f"""<a class=fab href="/config?f={html.escape(filtro)}" title="Configurações">🔧</a><div class=marca><img src="/static/logo-256.png?v=2" alt=""><span>Atendimento <b>Tamino</b></span>{ponto_html()}<button type=button class=tema onclick="trocarTema()" title="Alternar tema claro/escuro" aria-label="Alternar tema claro/escuro">🌓</button></div>{status_html()}{abas(titulo, filtro)}
 <div class=grid><div>{principal}</div>
 <div class=feed><b>Conversas</b>
 <form action=/buscar class=busca><input type=search name=q placeholder="🔎 Buscar conversa…"><input type=hidden name=f value="{html.escape(filtro)}"></form>
 <div class=filtro><a href="?f=novas" class="{'on' if filtro == 'novas' else ''}">Aguardando resposta</a>
-<a href="?f=todas" class="{'on' if filtro != 'novas' else ''}">Todas</a></div>{feed_html(filtro)}</div></div>"""
+<a href="?f=todas" class="{'on' if filtro != 'novas' else ''}">Todas</a></div>{feed_html(filtro)}</div></div>""")
 
 
-def status_html():
+def status_itens():
+    """[(nome, ok, quando ou None, msg)]: o que o vigia marcou (Tamino, Evo) mais a IA em uso."""
     import shutil
     ia = ("API Anthropic" if os.environ.get("ANTHROPIC_API_KEY") else
           "Claude Code" if shutil.which("claude") else None)
-    itens = [(n, ok, t, m) for n, (ok, t, m) in STATUS.items()]
-    itens.append(("IA", bool(ia), None, ia or "sem IA: texto padrão"))
+    return [(n, ok, t, m) for n, (ok, t, m) in list(STATUS.items())] + [("IA", bool(ia), None, ia or "sem IA: texto padrão")]
+
+
+def status_html():
+    itens = status_itens()
     def um(n, ok, t, m):
         idade = f" · {int(time.time() - t)}s" if t else ""
         rotulo = m if (n == "IA" or not ok) else "ativo"
@@ -1870,15 +1988,20 @@ def badge_status(st):
     return f'<span class="sb {cor}">{html.escape(STATUS_PT.get(st, st or ""))}</span>'
 
 
+def feed_itens(filtro="novas"):
+    """(itens na ordem do feed, ignorados, classificações): P1 e irritado aguardando resposta primeiro; em "novas", sem os ignorados."""
+    ign, cls = ignorados(), classificacoes_todas()
+    itens = [f for f in FEED if filtro != "novas" or (f["tipo"] == "incoming" and f["id"] not in ign)]
+    itens.sort(key=lambda f: urgencia(cls.get(f["id"])) if f["tipo"] == "incoming" else 2)  # estável: o resto da ordem fica
+    return itens, ign, cls
+
+
 def feed_html(filtro="novas"):
     if not FEED:
         return "<p class=vazio>Aguardando o vigia…</p>"
-    ign = ignorados()
-    itens = [f for f in FEED if filtro != "novas" or (f["tipo"] == "incoming" and f["id"] not in ign)]
+    itens, ign, cls = feed_itens(filtro)
     if not itens:
         return "<p class=vazio>Nenhuma conversa aguardando resposta.</p>"
-    cls = classificacoes_todas()
-    itens.sort(key=lambda f: urgencia(cls.get(f["id"])) if f["tipo"] == "incoming" else 2)  # estável: o resto da ordem fica
     return ("".join(fi_html(f, filtro, ign, cls) for f in itens[:40])
             + f'<a class=vermais href="/buscar?status=all&f={filtro}">Ver todas as conversas, inclusive antigas ›</a>')
 
@@ -1896,15 +2019,21 @@ def ignorar(conv, nome, sim=True):
             c.execute("delete from ignorados where conv=?", (conv,))
 
 
+def avatar_json(f):
+    """Avatar de um item do feed: foto só se for https (thumbnail assinado do Evo), matiz fixo por conversa e iniciais."""
+    import hashlib
+    foto = f.get("foto") or ""
+    h = int(hashlib.sha1(str(f.get("id") or f["nome"]).encode()).hexdigest()[:4], 16) % 360  # cor fixa por conversa: muda de grupo para grupo, não a cada recarga
+    return {"foto": foto if foto.startswith("https://") else "", "grupo": bool(f.get("grupo")), "cor": h, "iniciais": iniciais(f["nome"])}
+
+
 def avatar_html(f):
     """Foto do contato/grupo (thumbnail assinado do Evo) sobre as iniciais: sem foto, ou se a URL expirar, ficam as iniciais.
     Grupo = quadrado arredondado, contato = círculo."""
-    foto = f.get("foto") or ""
-    img = (f'<img src="{html.escape(foto, quote=True)}" alt="" loading=lazy referrerpolicy=no-referrer onerror="this.remove()">'
-           if foto.startswith("https://") else "")
-    import hashlib
-    h = int(hashlib.sha1(str(f.get("id") or f["nome"]).encode()).hexdigest()[:4], 16) % 360  # cor fixa por conversa: muda de grupo para grupo, não a cada recarga
-    return f'<span class="fav{" gr" if f.get("grupo") else ""}" style="--h:{h}" aria-hidden=true>{html.escape(iniciais(f["nome"]))}{img}</span>'
+    a = avatar_json(f)
+    img = (f'<img src="{html.escape(a["foto"], quote=True)}" alt="" loading=lazy referrerpolicy=no-referrer onerror="this.remove()">'
+           if a["foto"] else "")
+    return f'<span class="fav{" gr" if a["grupo"] else ""}" style="--h:{a["cor"]}" aria-hidden=true>{html.escape(a["iniciais"])}{img}</span>'
 
 
 def fi_html(f, filtro, ign=None, cls=None):
@@ -2004,6 +2133,8 @@ def msgs_html(ctx, acoes=False):
                         f'<button type=button onclick="apagarMsg(\'{mid}\')" title="Apagar">🗑</button>')
             bts += "</span>"
         texto = "<i>mensagem apagada</i>" if m.get("apagada") else html.escape(m["texto"])
+        if m["tipo"] == "activity":
+            return f'<div class=msis>{html.escape(m["texto"])} · {html.escape(m["hora"])}</div>'
         entra = m["tipo"] == "incoming"
         av = f'<span class=av aria-hidden=true>{html.escape(iniciais(m["nome"]))}</span>' if entra else ""
         return (f'<div class="msg {"in" if entra else "out"}">{av}<div class=bolha>{cit}<div class=mh><b>{html.escape(m["nome"] or "")}</b>'
@@ -2758,9 +2889,172 @@ def qr_svg(texto):
     return r.stdout if r.returncode == 0 else ""
 
 
+# ---------- API JSON da casca React (formato = tipos de web/src/lib/api.ts; ver docs/REACT-API.md) ----------
+def classe_json(k):
+    return {"categoria": k[0] or "", "sentimento": k[1], "prioridade": k[2]} if k else None
+
+
+def msgs_json(hist):
+    """Mensagens no formato da API, com o texto real (como a tela antiga). Áudio sai pelo proxy /audio; anexo só com URL http(s)."""
+    por_id = {str(m["id"]): m for m in hist if m.get("id")}
+
+    def um(m):
+        o, apagada = por_id.get(str(m.get("reply") or "")), bool(m.get("apagada"))
+        texto = "" if apagada else m.get("texto") or ""
+        anexos = [{"tipo": a.get("tipo") or "file",
+                   "url": "/audio?u=" + urllib.parse.quote(a["url"], safe="") if a.get("tipo") == "audio" else a["url"],
+                   "thumb": a.get("thumb") or "", "nome": a.get("nome") or "arquivo"}
+                  for a in m.get("anexos") or [] if str(a.get("url") or "").startswith(("https://", "http://"))]
+        citada = (f'{o.get("nome") or ""}: ' + ("mensagem apagada" if o.get("apagada") else o.get("texto") or "anexo"))[:120] if o else ""
+        return {"id": str(m.get("id") or ""), "tipo": m.get("tipo") or "", "nome": m.get("nome") or "", "hora": m.get("hora") or "",
+                "ts": m.get("ts") or 0, "texto": texto, "reply": str(m["reply"]) if m.get("reply") else None, "reply_preview": citada,
+                "apagada": apagada, "privada": bool(m.get("privada")), "anexos": anexos, "traduzivel": outra_lingua(texto)}
+    return [um(m) for m in hist if m.get("texto") or m.get("anexos") or m.get("apagada")]
+
+
+def escalada_json(e, consultas=(), hist=()):
+    """A escalação viva no formato da API; a pergunta ao N2 só vem pronta enquanto está aberta (ainda não enviada)."""
+    if not e:
+        return None
+    return {"id": e["id"], "status": e["status"], "motivo": e["motivo"], "motivo_txt": MOTIVOS_N2.get(e["motivo"], e["motivo"]),
+            "falta": e["falta"] or "", "resposta": e["resposta"] or "",
+            "pergunta": pergunta_n2(e["nome"], e["motivo"], e["falta"], consultas, hist) if e["status"] == "aberta" else ""}
+
+
+def cards_pendentes(rid=None):
+    """(linhas dos cards pendentes na ordem da fila: urgência e depois chegada, classificações). rid = só aquele card."""
+    with db() as c:
+        rows = c.execute("select id,coalesce(nome,conversa),texto,alerta,criado,detalhes,conversa from rascunhos "
+                         "where status='pendente' and (?1 is null or id=?1) order by criado", (rid,)).fetchall()
+    cls = classificacoes_todas()
+    rows.sort(key=lambda r: urgencia(cls.get(r[6])))
+    return rows, cls
+
+
+def card_json(r, cls):
+    rid, nome, tx, al, cr, det, cid = r
+    d = det_json(det)
+    ctx = [m for m in d.get("contexto") or [] if isinstance(m, dict)]
+    versoes = d.get("versoes") or {}
+    return {"id": rid, "conversa": cid, "nome": nome, "criado": cr or 0, "texto": tx or "", "alerta": rotulo_alerta(al),
+            "redigindo": bool(d.get("redigindo")), "contexto": msgs_json(ctx),
+            "versoes": {k: versoes[k] for k in VARIANTES if versoes.get(k)},
+            "sigilo": d.get("sigilo") or {}, "memoria": d.get("memoria") or "",
+            "escalada": escalada_json(escalada_de(cid), d.get("consultas") or [], ctx),
+            "idioma": idioma(cid, ctx), "classe": classe_json(cls.get(cid)),
+            "avatar": avatar_json(next((x for x in FEED if x["id"] == cid), {"id": cid, "nome": nome}))}
+
+
+def api_estado(remoto=False):
+    agora, (em, desde), (ini, fim) = time.time(), ponto_atual(), turno()
+    with db() as c:
+        fila = c.execute("select count(*) from rascunhos where status='pendente'").fetchone()[0]
+    status = [{"nome": n, "ok": bool(ok), "msg": ((m or "") if n == "IA" or not ok else "ativo")[:60],
+               "idade_s": int(agora - t) if t else None, "detalhe": m or ""} for n, ok, t, m in status_itens()]
+    return {"token": TOKEN, "remoto": remoto, "status": status, "fila": fila, "atendente": cfg("atendente", "Suporte"),
+            "ponto": {"em_servico": em, "desde": desde, "turno": f"{ini:%H:%M}–{fim:%H:%M}",
+                      "msg_entrada": msg_ponto("entrada"), "msg_saida": msg_ponto("saida")}}
+
+
+def api_feed(filtro="novas"):
+    itens, ign, cls = feed_itens(filtro)
+    return [{"id": f["id"], "nome": f["nome"], "quem": f.get("quem") or "", "texto": (f.get("texto") or "")[:200], "hora": f.get("hora") or "",
+             "tipo": f.get("tipo") or "", "status": f.get("status") or "", "pendente": int(f.get("pendente") or 0),
+             "avatar": avatar_json(f), "ignorado": f["id"] in ign, "n2": eh_n2(f["nome"]), "classe": classe_json(cls.get(f["id"]))}
+            for f in itens[:60]]
+
+
+def api_fila():
+    rows, cls = cards_pendentes()
+    rap = rapidas()  # já com {atendente} trocado e os textos editados na aba ⚙️
+    return {"cards": [card_json(r, cls) for r in rows],
+            "rapidas": {k: [{"rotulo": r, "texto": t.get(k) or t["pt"]} for r, t in rap] for k in IDIOMAS}}
+
+
+def api_conversa(cid, antes=""):
+    """Conversa aberta: 20 últimas do Evo, memória, escalação viva e idioma. Com antes=<id da mensagem>: só as 20 anteriores."""
+    hist = evo_historico(cid, antes or None)
+    lote = {"mensagens": msgs_json(hist), "mais_antiga": str(hist[0]["id"]) if len(hist) >= 20 else None}  # lote cheio: pode haver mais
+    if antes:
+        return lote
+    info = evo_conversa(cid)
+    contato = info.get("contact") or {}
+    f = next((x for x in FEED if x["id"] == cid), None) or {"id": cid, "nome": contato.get("name") or cid,
+                                                           "foto": contato.get("thumbnail") or "", "grupo": bool(info.get("is_group"))}
+    mem = mem_ler(cid)
+    return {"id": cid, "nome": f["nome"], "status": info.get("status") or "", "avatar": avatar_json(f),
+            "eh_n2": eh_n2(f["nome"]) or cid == conv_n2(), "ignorado": cid in ignorados(), **lote,
+            "memoria": {k: mem[k] for k in ("resumo", "pendencias", "fatos", "fixo", "atualizado")},
+            "escalada": escalada_json(escalada_de(cid), ultimas_consultas(cid), hist), "idioma": idioma(cid, hist)}
+
+
+def api_remoto():
+    r = REMOTO
+    cod, exp = r.codigo or ("", 0)
+    try:
+        url = r.url() if r.srv else ""
+    except OSError:  # sem rede local: ainda dá para ver o estado e desligar
+        url = ""
+    cod = cod if url and time.time() < exp else ""
+    return {"ligado": bool(r.srv), "link": url, "codigo": cod, "qr_svg": qr_svg(f"{url}?c={cod}" if cod else ""), "sessoes": len(r.sessoes)}
+
+
+def claude_chat(exe, mensagem, sessao=""):
+    """Um turno do chat com o Claude Code: assinatura do usuário, permissões completas, no diretório do projeto.
+    Devolve {resposta, sessao, erro?} e nunca lança. A conversa não vai para o log: só a telemetria em ia_eventos."""
+    import subprocess
+    t0 = time.time()
+    ms = lambda: int((time.time() - t0) * 1000)
+    sessao = sessao if RE_SESSAO.match(sessao or "") else ""
+
+    def falha(causa, msg):
+        registrar_ia("chat_claude", "", "", "claude-code", 0, causa, ms())
+        return {"resposta": "", "sessao": sessao, "erro": msg}
+    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}  # a chave do .env é dos rascunhos; aqui vale a assinatura
+    try:
+        r = subprocess.run([exe, "-p", "--output-format", "json", "--permission-mode", "bypassPermissions"] + (["--resume", sessao] if sessao else []),
+                           input=mensagem, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600, cwd=AQUI, env=env)
+    except subprocess.TimeoutExpired:
+        return falha("timeout de 600 s", "O Claude não respondeu em 10 minutos.")
+    except OSError as e:
+        return falha(f"erro desconhecido: {e}"[:80], "Não consegui iniciar o Claude Code.")
+    try:
+        d = json.loads(r.stdout)
+    except ValueError:
+        d = {}
+    if isinstance(d, list):  # saída em lista de eventos: o resultado é o último do tipo "result"
+        d = next((x for x in reversed(d) if isinstance(x, dict) and x.get("type") == "result"), {})
+    d = d if isinstance(d, dict) else {}
+    resposta = d.get("result") if isinstance(d.get("result"), str) else ""
+    sessao = d["session_id"] if RE_SESSAO.match(str(d.get("session_id") or "")) else sessao
+    if r.returncode or d.get("is_error") or not resposta.strip():
+        causa = causa_claude_code(limpar_log((resposta or r.stderr or r.stdout or "").strip())[-300:])
+        return falha(causa, f"O Claude falhou: {causa}.")
+    u = d.get("usage") if isinstance(d.get("usage"), dict) else {}
+    registrar_ia("chat_claude", "", "", "claude-code", 1, None, ms(), u.get("input_tokens"), u.get("output_tokens"))
+    return {"resposta": resposta, "sessao": sessao}
+
+
 class Painel(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
+
+    def _json(self, dados, code=200):
+        self.send_response(code)
+        self.send_header("content-type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(dados, ensure_ascii=False).encode())
+
+    def _host_ok(self):
+        """No PC, só aceita Host local: uma página de fora com DNS rebinding não lê o token nem dispara ações.
+        Sem Host (testes, curl antigo) passa; o PainelRemoto tem pareamento próprio."""
+        h = self.headers.get("host", "")
+        return isinstance(self, PainelRemoto) or not h or h.rsplit(":", 1)[0] in ("127.0.0.1", "localhost")
+
+    def end_headers(self):
+        self.send_header("x-frame-options", "SAMEORIGIN")  # outro site não emoldura o painel (clique enganado em Disparar)
+        self.send_header("content-security-policy", "frame-ancestors 'self'")
+        super().end_headers()
 
     def _html(self, corpo, code=200):
         self.send_response(code)
@@ -2772,6 +3066,67 @@ class Painel(BaseHTTPRequestHandler):
         self.send_response(303)
         self.send_header("location", destino)
         self.end_headers()
+
+    def _erro(self, msg, code):
+        """Erro da API em texto puro: é o que o api.ts mostra ao atendente."""
+        self.send_response(code)
+        self.send_header("content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(msg.encode())
+
+    def api(self, url):
+        p, qs, remoto = url.path, urllib.parse.parse_qs(url.query), isinstance(self, PainelRemoto)
+        try:
+            if p == "/api/estado":
+                return self._json(api_estado(remoto))
+            if p == "/api/feed":
+                return self._json({"itens": api_feed(qs.get("f", ["novas"])[0])})
+            if p == "/api/fila":
+                return self._json(api_fila())
+            if p.startswith("/api/card/") and p[10:].isdigit():
+                rows, cls = cards_pendentes(int(p[10:]))
+                return self._json({"existe": True, "card": card_json(rows[0], cls)} if rows else {"existe": False})
+            if p.startswith("/api/conversa/"):
+                cid, antes = p[14:], qs.get("antes", [""])[0]
+                if not RE_CONV.match(cid) or (antes and not RE_CONV.match(antes)):
+                    return self._erro("conversa inválida", 400)
+                return self._json(api_conversa(cid, antes))
+            if p == "/api/remoto":
+                return self._erro("Disponível só no computador.", 403) if remoto else self._json(api_remoto())
+        except Exception as e:
+            return self._erro(f"Falhou: {limpar_log(e)}", 502)
+        self._erro("não encontrado", 404)
+
+    def api_claude(self):
+        """Chat com o Claude Code completo: só no computador, nunca pelo celular pareado."""
+        n = int(self.headers.get("content-length", 0) or 0)
+        corpo = self.rfile.read(n) if 0 < n <= 1024 * 1024 else b""
+        # Host local obrigatório: este endpoint roda comandos no PC, e uma página de fora com DNS rebinding leria o token em /api/estado
+        if isinstance(self, PainelRemoto) or self.headers.get("host", "").rsplit(":", 1)[0] not in ("127.0.0.1", "localhost"):
+            return self._erro("Disponível só no computador.", 403)
+        origem = self.headers.get("origin", "")
+        if origem and urllib.parse.urlparse(origem).hostname not in ("127.0.0.1", "localhost"):
+            return self._erro("Origem não permitida.", 403)
+        if self.headers.get("x-token", "") != TOKEN:
+            return self._erro("token inválido: recarregue o painel", 403)
+        try:
+            d = json.loads(corpo)
+            mensagem, sessao = str(d.get("mensagem") or "").strip(), str(d.get("sessao") or "")
+        except (ValueError, AttributeError):
+            return self._erro("pedido inválido", 400)
+        if not mensagem:
+            return self._erro("mensagem vazia", 400)
+        import shutil
+        exe = shutil.which("claude")
+        if not exe:
+            return self._erro("Claude Code não encontrado neste computador: instale o claude e faça login nele.", 503)
+        if not _CLAUDE_LOCK.acquire(blocking=False):
+            return self._erro("O Claude ainda está respondendo o pedido anterior. Espere terminar.", 409)
+        try:
+            saida = claude_chat(exe, mensagem, sessao)
+        finally:
+            _CLAUDE_LOCK.release()
+        self._json(saida)
 
     def remoto_html(self):
         if isinstance(self, PainelRemoto):
@@ -2856,7 +3211,8 @@ ligue só em rede confiável. Desligar desconecta todos os celulares.</p>"""
         q = urllib.parse.urlencode({"de": qs.get("de", ""), "ate": qs.get("ate", ""), "print": "1"})
         with tempfile.TemporaryDirectory() as tmp:
             saida = Path(tmp) / f"insights.{fmt}"
-            r = subprocess.run([sys.executable, str(AQUI / "exportar.py"), f"http://127.0.0.1:8765/insights?{q}", str(saida)],
+            # /classico + embed: /insights agora devolve a casca React, e o PDF precisa da tela antiga sem marca nem abas
+            r = subprocess.run([sys.executable, str(AQUI / "exportar.py"), f"http://127.0.0.1:8765/classico/insights?{q}&embed=1", str(saida)],
                                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
             if r.returncode or not saida.exists():
                 return self._html(f"Falhou ao exportar: {html.escape((r.stderr or r.stdout)[-300:])}", 502)
@@ -3023,20 +3379,49 @@ escalação viva e rascunho pendente ficam. O backup do histórico e os casos do
         self._ir("/config")
 
     def estatico(self, path):
-        nome = path.rsplit("/", 1)[-1]
-        f = AQUI / "static" / nome
-        if nome not in ("favicon.png", "logo-256.png", "logo-512.png") or not f.exists():
+        if path.startswith("/static/app/"):  # build do React: só arquivo que, resolvido, fica dentro de static/app
+            base = (AQUI / "static" / "app").resolve()
+            try:
+                f = (base / urllib.parse.unquote(path[len("/static/app/"):])).resolve()
+            except (OSError, ValueError):  # byte nulo ou caminho que o sistema recusa
+                f = base
+            tipo = TIPOS_APP.get(f.suffix.lower())
+            ok = bool(tipo) and f.is_relative_to(base) and f.is_file()
+            cache = "max-age=31536000, immutable" if base / "assets" in f.parents else "no-cache"  # assets têm hash no nome; o index não
+        else:
+            nome = path.rsplit("/", 1)[-1]
+            f, tipo, cache = AQUI / "static" / nome, "image/png", "max-age=86400"
+            ok = nome in ("favicon.png", "logo-256.png", "logo-512.png") and f.exists()
+        if not ok:
             return self._html("não encontrado", 404)
         self.send_response(200)
-        self.send_header("content-type", "image/png")
-        self.send_header("cache-control", "max-age=86400")
+        self.send_header("content-type", tipo)
+        self.send_header("cache-control", cache)
         self.end_headers()
         self.wfile.write(f.read_bytes())
 
     def do_GET(self):
+        if not self._host_ok():
+            return self._html("Endereço não permitido: abra o painel em http://127.0.0.1:8765", 403)
         url = urllib.parse.urlparse(self.path)
         if url.path.startswith("/static/"):
             return self.estatico(url.path)
+        if url.path.startswith("/api/"):
+            return self.api(url)
+        if url.path == "/classico" or url.path.startswith("/classico/"):  # tela antiga; com ?embed=1, só o conteúdo (iframe da casca)
+            resto = self.path[len("/classico"):]
+            self.path = resto if resto.startswith("/") else "/" + resto
+            _REQ.embed = urllib.parse.parse_qs(url.query).get("embed") == ["1"]
+            try:
+                return self._get_antigo()
+            finally:
+                _REQ.embed = False
+        if RE_SPA.fullmatch(url.path) and (AQUI / "static" / "app" / "index.html").is_file():
+            return self.estatico("/static/app/index.html")
+        return self._get_antigo()  # sem build do React, o painel antigo responde em tudo
+
+    def _get_antigo(self):
+        url = urllib.parse.urlparse(self.path)
         filtro = urllib.parse.parse_qs(url.query).get("f", ["novas"])[0]
         if url.path.startswith("/c/") and url.path.endswith("/anteriores"):
             cid = url.path[3:-len("/anteriores")]
@@ -3195,10 +3580,20 @@ escalação viva e rascunho pendente ficam. O backup do histórico e os casos do
             self.end_headers()
             self.wfile.write(dados)
             return
+        if url.path.startswith("/card/") and url.path[6:].isdigit():
+            with db() as c:
+                r = c.execute("select texto, alerta, detalhes, conversa, status from rascunhos where id=?", (int(url.path[6:]),)).fetchone()
+            if not r or r[4] != "pendente":
+                return self._json({"existe": False})
+            tx, al, det, cid = r[0], r[1], r[2], r[3]
+            return self._json({"existe": True, "conv": contexto_html(det), "versoes": versoes_html(int(url.path[6:]), det, tx, idioma(cid)),
+                               "alerta": html.escape(rotulo_alerta(al)), "ultima": html.escape(ultima_msg(det)),
+                               "redigindo": bool(det_json(det).get("redigindo"))})
         if url.path == "/novidades":
             desde = float(urllib.parse.parse_qs(url.query).get("desde", ["0"])[0] or 0)
             ev = [{"t": t, "conv": c, "nome": n, "texto": x} for t, c, n, x in EVENTOS if t > desde]
-            corpo = json.dumps({"agora": time.time(), "eventos": ev}).encode()
+            cards = sorted({rid for t, _, rid in CARDS_MUDARAM if t > desde})
+            corpo = json.dumps({"agora": time.time(), "eventos": ev, "cards": cards}).encode()
             self.send_response(200)
             self.send_header("content-type", "application/json")
             self.end_headers()
@@ -3219,18 +3614,18 @@ escalação viva e rascunho pendente ficam. O backup do histórico e os casos do
             return self.taxas(urllib.parse.parse_qs(url.query).get("q", [""])[0], filtro)
         if url.path.startswith("/taxas/"):
             return self.taxa_detalhe(url.path[7:], filtro)
-        with db() as c:
-            rows = c.execute("select id,coalesce(nome,conversa),texto,alerta,criado,detalhes,conversa from rascunhos where status='pendente' order by criado").fetchall()
-        cls = classificacoes_todas()
-        rows.sort(key=lambda r: urgencia(cls.get(r[6])))
+        rows, cls = cards_pendentes()
         cards = "".join(f"""
-<form method=post class=card>
+<form method=post class="card fcard">
   <input type=hidden name=t value="{TOKEN}"><input type=hidden name=id value={rid}><input type=hidden name=f value="{html.escape(filtro)}">
-  <details class=cd open><summary><div class=meta><b>{html.escape(nome)}</b>{selo_classe(cls.get(cid))} · {datetime.fromtimestamp(cr, TZ):%d/%m %H:%M}
-  <button name=acao value=descartar class=xcard title="Fechar (descartar este card)" onclick="event.stopPropagation()">✕</button>
-  <a class=abrir href="/c/{html.escape(cid)}?f={html.escape(filtro)}">abrir conversa ›</a></div>
-  <div class=ultima>{html.escape(ultima_msg(det))}</div></summary>
-  {f'<div class=alerta>⚠ {html.escape(al.lstrip('⚠ '))}</div>' if al else ''}
+  <button name=acao value=descartar class=xcard title="Descartar este card" aria-label="Descartar este card">✕</button>
+  <details class=cd data-id={rid}><summary>
+  <div class=ch>{avatar_html(next((x for x in FEED if x["id"] == cid), {"id": cid, "nome": nome}))}<div class=cm>
+  <div class=cn><b title="{html.escape(nome, quote=True)}">{html.escape(nome)}</b>{selo_classe(cls.get(cid))}</div><small>{datetime.fromtimestamp(cr, TZ):%d/%m %H:%M}</small></div></div>
+  <div class=ultima>{html.escape(ultima_msg(det)) or "Sem mensagem do cliente no contexto."}</div>
+  <div class=novas hidden>Mensagem nova nesta conversa</div>
+  <div class=calerta{'' if al else ' hidden'}>{html.escape(rotulo_alerta(al))}</div>
+  <div class=cfoot><span class=abre>Responder ›</span><span class=fecha>Recolher ‹</span></div></summary>
   {contexto_html(det)}
   {escalada_html(escalada_de(cid), det)}
   {memoria_usada_html(det)}
@@ -3238,7 +3633,8 @@ escalação viva e rascunho pendente ficam. O backup do histórico e os casos do
   {versoes_html(rid, det, tx, idioma(cid))}
   <textarea name=texto id=tx{rid} rows=8 spellcheck=true lang=pt-BR>{html.escape(tx)}</textarea>{botao_corrigir(f"tx{rid}", idioma(cid))}
   <div class=acoes><button name=acao value=enviar>Disparar</button>
-  <button name=acao value=descartar class=sec>Descartar</button></div>
+  <button name=acao value=descartar class=sec>Descartar</button>
+  <a class=abrir href="/c/{html.escape(cid)}?f={html.escape(filtro)}">abrir conversa ›</a></div>
   </details>
 </form>""" for rid, nome, tx, al, cr, det, cid in rows) or "<p class=vazio>Fila vazia.</p>"
         self._html(pagina("Fila de respostas", f"<h2>Fila de respostas ({len(rows)})</h2><div class=fila>{cards}</div>", filtro))
@@ -3556,12 +3952,16 @@ function apagarMsg(id){{if(confirm('Apagar esta mensagem? Ela some para o client
         return campos, arquivos
 
     def do_POST(self):
+        if not self._host_ok():
+            return self._html("Endereço não permitido: abra o painel em http://127.0.0.1:8765", 403)
         if self.path == "/ping":
             with db() as c:
                 c.execute("insert or ignore into ativo values(?)", (int(time.time() // 60),))
             self.send_response(204)
             self.end_headers()
             return
+        if self.path.split("?")[0] == "/api/claude":  # corpo JSON: antes do _ler_form
+            return self.api_claude()
         try:
             f, arquivos = self._ler_form()
         except ValueError as e:
@@ -4774,6 +5174,13 @@ def treino_html():
 
 
 def _teste_ab():
+    Cx = "f3333333-1111-1111-1111-111111111111"  # um card por conversa: mensagem nova atualiza o pendente, mesmo id
+    a1 = enfileirar(Cx, "um", {"contexto": []}, None, "G")
+    a2 = card_imediato(Cx, "G", [{"id": "z", "tipo": "incoming", "nome": "Ana", "texto": "nova", "hora": ""}])
+    with db() as c:
+        assert a1 == a2 and c.execute("select count(*), max(texto) from rascunhos where conversa=? and status='pendente'", (Cx,)).fetchone() == (1, "um")
+    assert det_json(json.dumps({"contexto": [1]})) and any(r == a1 for _, _, r in CARDS_MUDARAM)
+    esquecer_cliente(Cx)
     g = globals()
     CA, CB, CN = (f"{i}b111111-1111-1111-1111-111111111111" for i in "abc")
     UID = "6979f536-9a24-4feb-b902-e9522c025010"
@@ -4809,16 +5216,20 @@ def _teste_ab():
         g.update(_redigir_claude_code=backend, _redigir_api=backend, tamino_lookup=lambda i: {"hits": []})
         h = lambda i, tipo, t: {"id": f"ab-h{i}", "tipo": tipo, "nome": "Ana", "texto": t, "hora": "", "ts": i, "reply": None, "anexos": []}
         hist = [h(1, "incoming", "meu saque não caiu"), h(2, "outgoing", "já vejo aqui"), h(3, "incoming", "e aí? cpf 123.456.789-09"), h(4, "incoming", f"id {UID}")]
+        det = {}
+        def ler(k, r):  # tira o card da fila depois de ler, como um envio: o próximo preparar_resposta cria outro
+            with db() as c:
+                det[k] = c.execute("select detalhes from rascunhos where id=?", (r["rascunho_id"],)).fetchone()[0]
+                c.execute("update rascunhos set status='enviado' where id=?", (r["rascunho_id"],))
+            return r
         try:
-            r1 = preparar_resposta(CB, ids=[UID], nome="Cliente AB", historico=hist)
+            r1 = ler("1", preparar_resposta(CB, ids=[UID], nome="Cliente AB", historico=hist))
             RESP["info_b"] = None
-            r2 = preparar_resposta(CB, ids=[UID], nome="Cliente AB", historico=hist)
+            r2 = ler("2", preparar_resposta(CB, ids=[UID], nome="Cliente AB", historico=hist))
             RESP["info_b"] = "Foi na GOWD."
-            r3 = preparar_resposta(CB, ids=[UID], nome="Cliente AB", historico=hist)
+            r3 = ler("3", preparar_resposta(CB, ids=[UID], nome="Cliente AB", historico=hist))
         finally:
             g.update(orig)
-        with db() as c:
-            det = {k: c.execute("select detalhes from rascunhos where id=?", (r["rascunho_id"],)).fetchone()[0] for k, r in (("1", r1), ("2", r2), ("3", r3))}
         d1, d2, d3 = (json.loads(det[k]) for k in "123")
         assert r1["texto"] == "texto A informativo." and r1["escalada"] is None and "[[N2" not in det["1"]
         assert list(d1["versoes"]) == ["info", "info_b", "generico"] and d1["versoes"]["info_b"] == "texto B curto." and not d1["sigilo"]
@@ -4855,6 +5266,176 @@ def _teste_ab():
             esquecer_cliente(x)
 
 
+def _teste_api():
+    """Rotas da casca React com um handler falso (sem socket): /api/*, estático, casca, /classico embed e /api/claude."""
+    import io
+    import shutil
+    import subprocess
+    import tempfile
+    import types
+    g = globals()
+    C, D = "a4444444-1111-1111-1111-111111111111", "b4444444-1111-1111-1111-111111111111"
+    M1, M2, SID = "c4444444-0000-0000-0000-000000000001", "c4444444-0000-0000-0000-000000000002", "0123abcd-0000-0000-0000-00000000beef"
+
+    def pedir(caminho, classe=Painel, corpo=None, **headers):
+        """(código, cabeçalhos, corpo). corpo = POST; cabeçalhos por nome com _ no lugar de -."""
+        h = classe.__new__(classe)
+        metodo = "GET" if corpo is None else "POST"
+        h.path, h.command, h.request_version, h.requestline = caminho, metodo, "HTTP/1.1", f"{metodo} {caminho} HTTP/1.1"
+        h.client_address, h.rfile, h.wfile = ("127.0.0.1", 0), io.BytesIO(corpo or b""), io.BytesIO()
+        h.headers = {"host": "127.0.0.1:8765", "content-length": str(len(corpo or b"")), **{k.replace("_", "-"): v for k, v in headers.items()}}
+        resp = {"headers": {}}
+        h.send_response = lambda code, *a: resp.update(code=code)
+        h.send_header = lambda k, v: resp["headers"].update({k.lower(): v})
+        h.end_headers = lambda: None
+        (Painel.do_GET if corpo is None else Painel.do_POST)(h)
+        return resp["code"], resp["headers"], h.wfile.getvalue().decode()
+    ler = lambda *a, **k: json.loads(pedir(*a, **k)[2])
+    msg = lambda i, tipo, texto, **k: {"id": i, "tipo": tipo, "nome": "Ana" if tipo == "incoming" else "Samuel", "texto": texto,
+                                      "hora": "10:00", "ts": 1, "reply": None, "anexos": [], **k}
+    ctx = [msg(M1, "incoming", "hello, any update?"),
+           msg(M2, "outgoing", "já vejo", reply=M1, anexos=[{"tipo": "audio", "url": "https://evo.exemplo/a.ogg", "thumb": None, "nome": "a.ogg"},
+                                                         {"tipo": "file", "url": "javascript:alert(1)", "thumb": None, "nome": "x"}])]
+    feed0, status0, hist0, conv0, aqui0 = FEED[:], dict(STATUS), g["evo_historico"], g.get("evo_conversa"), AQUI
+    which0, run0 = shutil.which, subprocess.run
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        # /api/estado
+        STATUS["Evo"] = (True, time.time() - 5, "")
+        e = ler("/api/estado")
+        assert set(e) == {"token", "remoto", "status", "ponto", "fila", "atendente"} and e["token"] == TOKEN and e["remoto"] is False, e
+        assert set(e["ponto"]) == {"em_servico", "desde", "turno", "msg_entrada", "msg_saida"} and "{" not in e["ponto"]["msg_entrada"], e
+        evo = next(s for s in e["status"] if s["nome"] == "Evo")
+        assert set(evo) == {"nome", "ok", "msg", "idade_s", "detalhe"} and evo["msg"] == "ativo" and evo["idade_s"] >= 5, evo
+        assert e["status"][-1]["nome"] == "IA" and e["status"][-1]["idade_s"] is None and isinstance(e["fila"], int)
+        assert ler("/api/estado", PainelRemoto)["remoto"] is True
+        # /api/fila e /api/card: card criado por enfileirar, com escalação viva e classificação
+        rid = enfileirar(C, "Só um instante.", {"contexto": ctx, "versoes": {"info": "A", "info_b": None, "generico": "G"},
+                                              "sigilo": {"info": ["código HTTP"]}, "memoria": "Resumo: x"}, "Tenant não verificado", "Cliente API")
+        abrir_escalada(C, "Cliente API", "missing_knowledge", "prazo do MED")
+        with db() as c:
+            c.execute("insert or replace into classificacoes(conversa,categoria,sentimento,prioridade) values(?,?,?,?)", (C, "saque", "irritado", 1))
+        fila = ler("/api/fila")
+        card = next(x for x in fila["cards"] if x["id"] == rid)
+        assert set(card) == {"id", "conversa", "nome", "criado", "texto", "alerta", "redigindo", "contexto", "versoes", "sigilo", "memoria",
+                             "escalada", "idioma", "classe", "avatar"}, card
+        assert (card["conversa"], card["nome"], card["texto"], card["alerta"], card["redigindo"]) == \
+            (C, "Cliente API", "Só um instante.", "⚠ Tenant não verificado", False), card
+        assert card["versoes"] == {"info": "A", "generico": "G"} and card["sigilo"] == {"info": ["código HTTP"]} and card["memoria"] == "Resumo: x"
+        assert card["idioma"] == "pt" and card["classe"] == {"categoria": "saque", "sentimento": "irritado", "prioridade": 1}, card
+        assert set(card["avatar"]) == {"foto", "grupo", "cor", "iniciais"} and card["avatar"]["iniciais"] == "CA" and 0 <= card["avatar"]["cor"] < 360
+        esc = card["escalada"]
+        assert set(esc) == {"id", "status", "motivo", "motivo_txt", "falta", "pergunta", "resposta"} and esc["status"] == "aberta", esc
+        assert esc["motivo_txt"] == MOTIVOS_N2["missing_knowledge"] and esc["pergunta"].startswith("[Cliente API]") and "Falta: prazo do MED" in esc["pergunta"]
+        m1, m2 = card["contexto"]
+        assert set(m1) == {"id", "tipo", "nome", "hora", "ts", "texto", "reply", "reply_preview", "apagada", "privada", "anexos", "traduzivel"}, m1
+        assert m1["traduzivel"] and not m2["traduzivel"] and m1["reply"] is None and m2["reply"] == M1 and m2["reply_preview"] == "Ana: hello, any update?"
+        assert m2["anexos"] == [{"tipo": "audio", "url": "/audio?u=https%3A%2F%2Fevo.exemplo%2Fa.ogg", "thumb": "", "nome": "a.ogg"}], m2  # javascript: fica de fora
+        assert set(fila["rapidas"]) == set(IDIOMAS) and set(fila["rapidas"]["pt"][0]) == {"rotulo", "texto"} and len(fila["rapidas"]["zh"]) == len(RAPIDAS)
+        assert "{atendente}" not in json.dumps(fila["rapidas"], ensure_ascii=False)
+        um = ler(f"/api/card/{rid}")
+        assert um["existe"] is True and um["card"]["id"] == rid and ler("/api/card/99999999") == {"existe": False}
+        # /api/feed com FEED falso: mesma ordem e filtro do feed antigo
+        FEED[:] = [{"id": D, "nome": "Outro Grupo", "quem": "", "texto": "ok", "status": "resolved", "tipo": "outgoing", "hora": "09:00",
+                    "pendente": 0, "grupo": False, "foto": ""},
+                   {"id": C, "nome": "Cliente API", "quem": "Ana", "texto": "oi", "status": "open", "tipo": "incoming", "hora": "10:02",
+                    "pendente": 2, "grupo": True, "foto": "https://evo.exemplo/f.png"}]
+        novas, todas = ler("/api/feed?f=novas")["itens"], ler("/api/feed?f=todas")["itens"]
+        assert [i["id"] for i in novas] == [C] and [i["id"] for i in todas] == [C, D], todas  # P1 aguardando resposta sobe
+        assert set(novas[0]) == {"id", "nome", "quem", "texto", "hora", "tipo", "status", "pendente", "avatar", "ignorado", "n2", "classe"}, novas
+        assert novas[0]["avatar"] == {"foto": "https://evo.exemplo/f.png", "grupo": True, "cor": card["avatar"]["cor"], "iniciais": "CA"}, novas
+        assert novas[0]["classe"]["prioridade"] == 1 and novas[0]["pendente"] == 2 and not novas[0]["ignorado"] and not novas[0]["n2"]
+        assert todas[1]["classe"] is None and todas[1]["status"] == "resolved"
+        # /api/conversa com Evo falso: activity entra, apagada vem sem texto, ?antes= pagina
+        ANT = [msg(f"d4444444-0000-0000-0000-{i:012d}", "incoming", f"antiga {i}") for i in range(20)]
+        hist = ctx + [msg("c4444444-0000-0000-0000-000000000003", "activity", "Conversa atribuída"),
+                      msg("c4444444-0000-0000-0000-000000000004", "incoming", "texto que sumiu", apagada=True)]
+        g["evo_historico"] = lambda conv, antes_de=None: ANT if antes_de else hist
+        g["evo_conversa"] = lambda conv: {"status": "open", "contact": {"name": "Outro nome"}}
+        cv = ler(f"/api/conversa/{C}")
+        assert set(cv) == {"id", "nome", "status", "avatar", "eh_n2", "ignorado", "mensagens", "mais_antiga", "memoria", "escalada", "idioma"}, cv
+        assert (cv["id"], cv["nome"], cv["status"], cv["eh_n2"], cv["ignorado"], cv["mais_antiga"], cv["idioma"]) == \
+            (C, "Cliente API", "open", False, False, None, "pt"), cv
+        assert [m["tipo"] for m in cv["mensagens"]] == ["incoming", "outgoing", "activity", "incoming"]
+        assert cv["mensagens"][3]["apagada"] and cv["mensagens"][3]["texto"] == "" and cv["mensagens"][0]["texto"] == "hello, any update?"
+        assert set(cv["memoria"]) == {"resumo", "pendencias", "fatos", "fixo", "atualizado"} and cv["escalada"]["status"] == "aberta"
+        ant = ler(f"/api/conversa/{C}?antes={M1}")
+        assert set(ant) == {"mensagens", "mais_antiga"} and len(ant["mensagens"]) == 20 and ant["mais_antiga"] == ANT[0]["id"], ant
+        assert pedir("/api/conversa/xyz")[0] == 400 and pedir(f"/api/conversa/{C}?antes=xyz")[0] == 400 and pedir("/api/nada")[0] == 404
+        g["evo_historico"] = lambda conv, antes_de=None: (_ for _ in ()).throw(RuntimeError("evo fora"))
+        code, _, corpo = pedir(f"/api/conversa/{C}")
+        assert code == 502 and "evo fora" in corpo, corpo
+        # /api/remoto: só no PC
+        rm = ler("/api/remoto")
+        assert set(rm) == {"ligado", "link", "codigo", "qr_svg", "sessoes"} and rm["ligado"] is False and rm["qr_svg"] == "", rm
+        assert pedir("/api/remoto", PainelRemoto)[0] == 403
+        # estático e casca numa pasta temporária no lugar de AQUI
+        app = tmp / "static" / "app"
+        (app / "assets").mkdir(parents=True)
+        (app / "assets" / "a.js").write_text("1", encoding="utf-8")
+        (tmp / "app.py").write_text("segredo", encoding="utf-8")
+        (tmp / "segredo.json").write_text("{}", encoding="utf-8")
+        g["AQUI"] = tmp
+        assert "<nav class=abas>" in pedir("/insights")[2]  # sem index.html: a tela antiga responde
+        (app / "index.html").write_text("<!doctype html><div id=root>CASCA</div>", encoding="utf-8")
+        for ruim in ("/static/app/../../app.py", "/static/app/../../segredo.json", "/static/app/..%2f..%2fsegredo.json", "/static/app/%00",
+                     "/static/app/assets/nada.js", "/static/app/"):
+            assert pedir(ruim)[0] == 404, ruim
+        code, hd, corpo = pedir("/static/app/assets/a.js")
+        assert (code, corpo) == (200, "1") and hd["content-type"].startswith("text/javascript") and hd["cache-control"] == "max-age=31536000, immutable", hd
+        for rota in ("/", "/insights?f=novas", f"/c/{C}", "/taxas", f"/taxas/{C}", "/config", "/remoto", "/buscar?q=x"):
+            code, hd, corpo = pedir(rota)
+            assert code == 200 and "CASCA" in corpo and hd["cache-control"] == "no-cache", rota
+        assert "CASCA" in pedir("/insights", PainelRemoto)[2]
+        # /classico: tela antiga; com embed=1, só o conteúdo, e a flag não vaza para o pedido seguinte
+        code, _, corpo = pedir("/classico/insights?embed=1")
+        assert code == 200 and "Meus insights" in corpo and "<base target=_top>" in corpo and "CASCA" not in corpo, corpo[-600:]
+        assert not any(x in corpo for x in ("<div class=marca>", "<div class=status>", "<nav class=abas>", "<a class=fab", "<div class=feed>")), corpo[-600:]
+        assert not getattr(_REQ, "embed", False)
+        cheio = pedir("/classico/insights")[2]
+        assert "<div class=marca>" in cheio and "<div class=feed>" in cheio and "<base target=_top>" not in cheio and "CASCA" not in cheio
+        # /api/claude: só PC, Host local, token, um por vez; subprocesso falso
+        corpo = json.dumps({"mensagem": "oi", "sessao": SID}).encode()
+        assert pedir("/api/claude", corpo=corpo, x_token="errado")[0] == 403
+        assert pedir("/api/claude", PainelRemoto, corpo, x_token=TOKEN)[0] == 403
+        assert pedir("/api/claude", corpo=corpo, x_token=TOKEN, host="painel.exemplo:8765")[0] == 403
+        CMD = []
+
+        def run_falso(cmd, **k):
+            CMD.append((cmd, k))
+            return types.SimpleNamespace(returncode=0, stderr="", stdout=json.dumps({"type": "result", "is_error": False, "result": "feito", "session_id": SID}))
+        shutil.which, subprocess.run = (lambda n: None), run_falso
+        assert pedir("/api/claude", corpo=corpo, x_token=TOKEN)[0] == 503 and not CMD
+        shutil.which = lambda n: "/falso/claude"
+        os.environ["ANTHROPIC_API_KEY"] = "chave-de-teste"
+        code, _, saida = pedir("/api/claude", corpo=corpo, x_token=TOKEN)
+        assert code == 200 and json.loads(saida) == {"resposta": "feito", "sessao": SID}, saida
+        cmd, k = CMD[-1]
+        assert cmd == ["/falso/claude", "-p", "--output-format", "json", "--permission-mode", "bypassPermissions", "--resume", SID], cmd
+        assert k["input"] == "oi" and k["timeout"] == 600 and k["cwd"] == tmp and "ANTHROPIC_API_KEY" not in k["env"], k
+        assert db().execute("select tipo, backend, ok from ia_eventos order by id desc limit 1").fetchone() == ("chat_claude", "claude-code", 1)
+        pedir("/api/claude", corpo=json.dumps({"mensagem": "oi", "sessao": "--dangerously-skip-permissions"}).encode(), x_token=TOKEN)
+        assert len(CMD) == 2 and "--resume" not in CMD[-1][0], CMD[-1][0]
+        assert _CLAUDE_LOCK.acquire(blocking=False)  # livre depois de cada pedido
+        try:
+            assert pedir("/api/claude", corpo=corpo, x_token=TOKEN)[0] == 409 and len(CMD) == 2
+        finally:
+            _CLAUDE_LOCK.release()
+        subprocess.run = lambda cmd, **k: types.SimpleNamespace(returncode=1, stdout="", stderr="Invalid API key · Please run /login")
+        falhou = ler("/api/claude", corpo=corpo, x_token=TOKEN)
+        assert falhou["resposta"] == "" and "deslogado" in falhou["erro"], falhou
+        assert pedir("/api/claude", corpo=b"nao e json", x_token=TOKEN)[0] == 400
+    finally:
+        shutil.which, subprocess.run = which0, run0
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+        g.update(AQUI=aqui0, evo_historico=hist0, evo_conversa=conv0)
+        FEED[:] = feed0
+        STATUS.clear()
+        STATUS.update(status0)
+        shutil.rmtree(tmp, ignore_errors=True)
+        esquecer_cliente(C)
+
+
 def teste():
     """Self-check em banco temporário, sem rede e sem IA: tudo que sai da máquina é trocado por função falsa."""
     import tempfile
@@ -4863,6 +5444,7 @@ def teste():
                               "ia", "em_segundo_plano")}
     g["DB"] = Path(tempfile.mkdtemp()) / "teste.db"  # antes de qualquer cfg()/db(): nada toca o fila.db real
     cfg_salvar(vault_obsidian=str(g["DB"].parent / "vault"))  # nem o vault real do Obsidian
+    raj0, g["RAJADA_S"] = RAJADA_S, 0  # sem espera de rajada no teste
     env0 = {k: os.environ.pop(k) for k in ("N2_AUTO", "MEMORIA_AUTO", "ANTHROPIC_API_KEY", "CONV_N2", "GRUPO_N2") if k in os.environ}
     feed0, ev0 = FEED[:], EVENTOS[:]
     nada = lambda *a, **k: (_ for _ in ()).throw(AssertionError(f"rede/IA chamada no teste: {a[:1]}"))
@@ -4879,8 +5461,10 @@ def teste():
         _teste_retencao()
         _teste_backup()
         _teste_historico()
+        _teste_api()
     finally:
         g.update(orig)
+        g["RAJADA_S"] = raj0
         os.environ.update(env0)
         FEED[:], EVENTOS[:] = feed0, ev0
     print("ok\n\n" + txt)
@@ -5131,7 +5715,7 @@ if __name__ == "__main__":
         threading.Thread(target=vigia, daemon=True).start()
         threading.Thread(target=aquecer_webhooks, daemon=True).start()
         REMOTO.restaurar()
-        log("Painel: http://127.0.0.1:8765 (vigia a cada 15s)")
+        log("Painel: http://127.0.0.1:8765 (vigia a cada 2 s)")
         ThreadingHTTPServer(("127.0.0.1", 8765), Painel).serve_forever()
     elif modo == "teste":
         teste()

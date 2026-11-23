@@ -1,0 +1,16 @@
+/* Tokens do tema (iguais aos do app.py). Claro por padrão; escuro pelo sistema ou por data-theme. */
+:root{color-scheme:light;--card:#f5f5f4;--ring:#6366f1;--input:#d6d3d1;--muted:#e7e5e4;--accent:#f3e5f5;--border:#d6d3d1;--radius:1.25rem;
+--chart-1:#6366f1;--chart-2:#4f46e5;--chart-3:#4338ca;--primary:#6366f1;--secondary:#d6d3d1;--background:#e7e5e4;--foreground:#1e293b;
+--destructive:#ef4444;--muted-foreground:#6b7280;--accent-foreground:#374151;--primary-foreground:#ffffff;--secondary-foreground:#4b5563;
+--font-sans:"Plus Jakarta Sans",system-ui,sans-serif;--font-mono:"Roboto Mono",ui-monospace,monospace;
+--shadow:2px 2px 10px 4px hsl(240 4% 60% / .18);
+--field:#fafaf9;--link:#4f46e5;--in:#047857;--warn:#b45309;--n2:#4f46e5;--ok:#15803d;--ok-bg:#d1fae5;--ok-fg:#065f46;--er-bg:#fee2e2;--er-fg:#b91c1c;
+--bg:var(--background);--tx:var(--foreground);--mut:var(--muted-foreground);--ac:var(--primary)}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){color-scheme:dark;--card:#2c2825;--ring:#818cf8;--input:#3a3633;--muted:#1f1c19;--accent:#484441;
+--border:#3a3633;--chart-1:#818cf8;--chart-2:#6366f1;--chart-3:#4f46e5;--primary:#818cf8;--secondary:#3a3633;--background:#1e1b18;--foreground:#e2e8f0;
+--muted-foreground:#9ca3af;--accent-foreground:#d1d5db;--primary-foreground:#1e1b18;--secondary-foreground:#d1d5db;--shadow:2px 2px 10px 4px hsl(0 0% 0% / .18);
+--field:#1f1c19;--link:#a5b4fc;--in:#5fd3a4;--warn:#f5a524;--n2:#818cf8;--ok:#1f7a52;--ok-bg:#1f4d3d;--ok-fg:#9ff0cf;--er-bg:#5a2323;--er-fg:#ffb4b4}}
+:root[data-theme=dark]{color-scheme:dark;--card:#2c2825;--ring:#818cf8;--input:#3a3633;--muted:#1f1c19;--accent:#484441;
+--border:#3a3633;--chart-1:#818cf8;--chart-2:#6366f1;--chart-3:#4f46e5;--primary:#818cf8;--secondary:#3a3633;--background:#1e1b18;--foreground:#e2e8f0;
+--muted-foreground:#9ca3af;--accent-foreground:#d1d5db;--primary-foreground:#1e1b18;--secondary-foreground:#d1d5db;--shadow:2px 2px 10px 4px hsl(0 0% 0% / .18);
+--field:#1f1c19;--link:#a5b4fc;--in:#5fd3a4;--warn:#f5a524;--n2:#818cf8;--ok:#1f7a52;--ok-bg:#1f4d3d;--ok-fg:#9ff0cf;--er-bg:#5a2323;--er-fg:#ffb4b4}

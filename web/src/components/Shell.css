@@ -1,0 +1,61 @@
+/* Casca: menu | conteúdo | feed, sem max-width. Só o conteúdo, o menu e o feed rolam; a página não. */
+.cs{display:grid;grid-template-columns:auto minmax(0,1fr) auto;grid-template-rows:minmax(0,1fr);height:100dvh;overflow:hidden}
+.cs-menu-col{width:232px;min-height:0;overflow:hidden;border-right:1px solid var(--border);background:var(--card);
+  transition:width .2s cubic-bezier(.16,1,.3,1)}
+.cs.recolhido .cs-menu-col{width:68px}
+.cs-centro{position:relative;display:flex;flex-direction:column;min-width:0;min-height:0}
+/* padding-bottom: os botões flutuantes nunca ficam por cima do fim da tela (botões de ação das telas) */
+.conteudo{flex:1;min-height:0;padding:16px 20px 84px;overflow:auto;overscroll-behavior:contain}
+.conteudo:focus{outline:none}
+.cs-feed-col{display:flex;width:340px;min-height:0;border-left:1px solid var(--border);background:var(--card)}
+@media (width < 820px){
+  .cs{grid-template-columns:minmax(0,1fr)}
+  .conteudo{padding:12px 12px calc(88px + env(safe-area-inset-bottom))}
+}
+
+.cs-pular{position:fixed;top:-64px;left:12px;z-index:50;padding:10px 14px;border-radius:10px;background:var(--primary);color:var(--primary-foreground);font-weight:600}
+.cs-pular:focus{top:12px}
+
+/* peças comuns da casca (prefixo cs- para não colidir com as telas) */
+.cs-sr{position:absolute!important;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip-path:inset(50%);white-space:nowrap;border:0}
+.cs-mut{color:var(--muted-foreground)}
+.cs-bt{display:inline-flex;align-items:center;justify-content:center;gap:6px;min-height:36px;padding:0 14px;border:1px solid var(--border);border-radius:10px;
+  background:var(--card);color:var(--foreground);font-size:14px;font-weight:600;white-space:nowrap;
+  transition:background-color .15s ease-out,border-color .15s ease-out,transform .1s ease-out}
+.cs-bt:hover:not(:disabled){background:var(--background)}
+.cs-bt:active:not(:disabled){transform:scale(.97)}
+.cs-bt:disabled{opacity:.5;cursor:not-allowed}
+.cs-bt-pri{border-color:var(--primary);background:var(--primary);color:var(--primary-foreground)}
+.cs-bt-pri:hover:not(:disabled){background:color-mix(in srgb,var(--primary) 88%,var(--foreground))}
+.cs-bt-sm{min-height:32px;padding:0 10px;font-size:13px}
+.cs-ic{display:inline-grid;place-items:center;flex:0 0 auto;width:36px;height:36px;padding:0;border:0;border-radius:10px;background:transparent;
+  color:var(--muted-foreground);transition:background-color .15s ease-out,color .15s ease-out}
+.cs-ic:hover{background:var(--background);color:var(--foreground)}
+@media (pointer:coarse){.cs-bt,.cs-bt-sm{min-height:44px}.cs-ic{width:44px;height:44px}}
+.cs-n{display:inline-grid;place-items:center;min-width:20px;height:20px;padding:0 6px;border-radius:999px;background:var(--primary);
+  color:var(--primary-foreground);font-size:11px;font-weight:700;line-height:1;font-variant-numeric:tabular-nums}
+.cs-dot{display:inline-block;flex:0 0 auto;width:8px;height:8px;border-radius:50%;background:var(--muted-foreground)}
+.cs-dot.ok{background:var(--in)}
+.cs-dot.er{background:var(--destructive)}
+.cs-erro-linha{margin:10px 0 0;padding:8px 12px;border-radius:10px;background:var(--er-bg);color:var(--er-fg);font-size:13px;overflow-wrap:anywhere}
+
+/* botões flutuantes: dentro da coluna do meio, então no PC ficam à esquerda do feed sem cobrir a lista */
+.cs-fab{position:absolute;bottom:calc(16px + env(safe-area-inset-bottom));z-index:5;display:grid;place-items:center;width:52px;height:52px;padding:0;
+  border:1px solid var(--border);border-radius:50%;background:var(--card);color:var(--primary);box-shadow:var(--shadow);
+  transition:background-color .15s ease-out,transform .12s ease-out}
+.cs-fab:hover{background:var(--background)}
+.cs-fab:active{transform:scale(.95)}
+.cs-fab-esq{left:16px}
+.cs-fab-dir{right:16px}
+.cs-fab-pri{border-color:var(--primary);background:var(--primary);color:var(--primary-foreground)}
+.cs-fab-pri:hover{background:color-mix(in srgb,var(--primary) 88%,var(--foreground))}
+.cs-fab-dot{position:absolute;top:2px;right:2px;width:12px;height:12px;border:2px solid var(--card);border-radius:50%;background:var(--warn)}
+/* celular: some enquanto o teclado está aberto num campo da tela, para não tampar o composer */
+@media (width < 820px){.cs-centro:has(.conteudo :is(textarea,input):focus) .cs-fab{display:none}}
+
+/* conversa no celular: o chat precisa da altura toda */
+@media (width < 820px){
+  body:has(.cv) .cs-fab{display:none}
+  body:has(.cv) .cs-status{display:none}
+  .conteudo:has(> .cv){padding:0;overflow:hidden} /* a conversa rola sozinha e vai até a borda */
+}

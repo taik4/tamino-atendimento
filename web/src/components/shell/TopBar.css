@@ -1,0 +1,32 @@
+/* Container query: o que aparece depende da largura real da barra (muda com menu recolhido e feed aberto). */
+.cs-top{container-type:inline-size;display:grid;grid-template-columns:minmax(0,1fr) auto minmax(max-content,1fr);align-items:center;gap:12px;
+  min-height:56px;padding:8px 16px;border-bottom:1px solid var(--border);background:var(--card)}
+.cs-top-esq{display:flex;align-items:center}
+.cs-top-dir{display:flex;align-items:center;justify-content:flex-end;gap:8px;min-width:0}
+
+.cs-status{display:flex;align-items:center;gap:6px;min-width:0;margin:0;padding:0;list-style:none}
+.cs-pil{display:inline-flex;align-items:center;gap:6px;height:28px;padding:0 10px;border:1px solid var(--border);border-radius:999px;
+  background:var(--background);font-size:13px;white-space:nowrap;cursor:default}
+.cs-pil b{font-weight:600}
+.cs-pil.er{border-color:transparent;background:var(--er-bg);color:var(--er-fg)}
+.cs-idade{color:var(--muted-foreground);font-variant-numeric:tabular-nums}
+.cs-pil.er .cs-idade{color:inherit}
+
+.cs-ponto{display:flex;align-items:center;gap:10px;min-width:0}
+.cs-ponto-st{display:inline-flex;align-items:center;gap:8px;font-size:13px;white-space:nowrap}
+.cs-crono{font-weight:600;font-variant-numeric:tabular-nums}
+.cs-ponto-msg{margin:10px 0 0;padding:10px 12px;border-radius:12px;background:var(--background);font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere}
+
+.cs-conv-bt{position:relative}
+.cs-desde,.cs-idade,.cs-conv-rot{display:none}
+@container (min-width:620px){.cs-conv-rot{display:inline}}
+@container (min-width:760px){.cs-desde,.cs-idade{display:inline}}
+
+@media (width < 820px){
+  .cs-top{grid-template-columns:auto minmax(0,1fr);grid-template-areas:"esq dir" "st st";gap:6px 8px;
+    padding:max(6px,env(safe-area-inset-top)) 8px 8px}
+  .cs-top-esq{grid-area:esq}
+  .cs-top-dir{grid-area:dir}
+  .cs-status{grid-area:st;justify-content:center;overflow-x:auto;scrollbar-width:none}
+  .cs-status::-webkit-scrollbar{display:none}
+}

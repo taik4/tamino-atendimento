@@ -1,0 +1,16 @@
+.cs-rem-linha{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 0;border-top:1px solid var(--border)}
+.cs-dlg-cab+.cs-rem-linha{padding-top:0;border-top:0}
+.cs-rem-linha>span{display:flex;flex-direction:column;gap:2px;min-width:0;font-size:14px}
+.cs-rem-qr{width:216px;margin:4px auto 10px;padding:12px;border-radius:12px;background:#fff} /* QR precisa de fundo branco nos dois temas para ler */
+.cs-rem-qr svg{display:block;width:100%;height:auto}
+.cs-rem-link{margin:0 0 6px;color:var(--muted-foreground);font:12px/1.4 var(--font-mono);text-align:center;overflow-wrap:anywhere;user-select:all}
+.cs-rem-cod{font:600 22px/1.25 var(--font-mono);letter-spacing:.12em;font-variant-numeric:tabular-nums}
+
+.cs-switch{position:relative;flex:0 0 auto;width:46px;height:28px;padding:0;border:0;border-radius:999px;background:var(--input);
+  transition:background-color .18s ease-out}
+.cs-switch span{position:absolute;top:3px;left:3px;width:22px;height:22px;border-radius:50%;background:var(--muted-foreground);
+  transition:translate .18s cubic-bezier(.16,1,.3,1),background-color .18s ease-out}
+.cs-switch[aria-checked=true]{background:var(--primary)}
+.cs-switch[aria-checked=true] span{translate:18px 0;background:var(--primary-foreground)}
+.cs-switch:disabled{opacity:.55;cursor:wait}
+@media (pointer:coarse){.cs-switch{width:52px;height:32px}.cs-switch span{width:26px;height:26px}.cs-switch[aria-checked=true] span{translate:20px 0}}
